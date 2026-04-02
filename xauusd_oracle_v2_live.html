@@ -1,0 +1,2320 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>XAUUSD Oracle Live</title>
+<style>
+* { box-sizing: border-box; margin: 0; padding: 0; }
+body { background: #060d1a; color: #e2e8f0; font-family: "Courier New", monospace; }
+@keyframes pulse { 0%, 100% { opacity: 1; } 50% { opacity: 0.35; } }
+@keyframes slideIn { from { opacity: 0; transform: translateX(16px); } to { opacity: 1; transform: translateX(0); } }
+@keyframes fadeIn { from { opacity: 0; } to { opacity: 1; } }
+@keyframes glow { 0%, 100% { box-shadow: 0 0 4px #fbbf2444; } 50% { box-shadow: 0 0 10px #fbbf2477; } }
+::-webkit-scrollbar { width: 3px; }
+::-webkit-scrollbar-track { background: #060d1a; }
+::-webkit-scrollbar-thumb { background: #1e293b; border-radius: 2px; }
+button:hover { opacity: 0.82; transition: opacity 0.15s; }
+table { border-collapse: collapse; width: 100%; }
+th, td { padding: 7px 10px; text-align: left; font-size: 11px; border-bottom: 1px solid #0f172a; }
+select option { background: #1e293b; }
+input:focus, select:focus, textarea:focus { outline: 1px solid #fbbf2455; }
+@media (max-width: 960px) {
+  .top-grid, .signal-grid, .alarm-grid, .stats-grid, .ai-grid { grid-template-columns: 1fr !important; }
+  .tp-row { flex-direction: column; }
+}
+</style>
+</head>
+<body>
+<div id="app"></div>
+<script src="https://unpkg.com/react@18/umd/react.production.min.js"></script>
+<script src="https://unpkg.com/react-dom@18/umd/react-dom.production.min.js"></script>
+<script>
+const { useState, useEffect, useRef, useCallback } = React;
+const h = React.createElement;
+
+const STORAGE_KEY = "xauusd_oracle_live_v3";
+const BASE_CANDLE_MS = 60000;
+const HISTORY_LIMIT = 3000;
+const TF_CONFIG = {
+  M1: { label: "M1", minutes: 1, group: 1 },
+  M5: { label: "M5", minutes: 5, group: 5 },
+  M15: { label: "M15", minutes: 15, group: 15 },
+  M30: { label: "M30", minutes: 30, group: 30 },
+  H1: { label: "H1", minutes: 60, group: 60 },
+  H4: { label: "H4", minutes: 240, group: 240 },
+  D1: { label: "D1", minutes: 1440, group: 1440 }
+};
+
+function safeReadStorage() {
+  try {
+    const raw = localStorage.getItem(STORAGE_KEY);
+    return raw ? JSON.parse(raw) : {};
+  } catch (err) {
+    return {};
+  }
+}
+
+function formatPrice(value) {
+  return Number(value || 0).toLocaleString("en-US", {
+    minimumFractionDigits: 2,
+    maximumFractionDigits: 2
+  });
+}
+
+function formatAxisTime(timestamp, tf) {
+  const date = new Date(timestamp);
+  const options = { timeZone: "Asia/Colombo", hour12: false };
+  if (tf === "D1") {
+    return date.toLocaleDateString("en-GB", { ...options, month: "short", day: "numeric" });
+  }
+  if (tf === "H4" || tf === "H1") {
+    return date.toLocaleTimeString("en-GB", { ...options, hour: "2-digit", minute: "2-digit" });
+  }
+  return date.toLocaleTimeString("en-GB", { ...options, hour: "2-digit", minute: "2-digit" });
+}
+
+function formatSriLankaDateTime(timestamp) {
+  if (!timestamp) return "--";
+  return new Date(timestamp).toLocaleString("en-GB", {
+    timeZone: "Asia/Colombo",
+    hour12: false,
+    year: "numeric",
+    month: "short",
+    day: "2-digit",
+    hour: "2-digit",
+    minute: "2-digit",
+    second: "2-digit"
+  });
+}
+
+function getStaleThresholdMs(tf) {
+  const candleMs = (TF_CONFIG[tf]?.minutes || 1) * 60000;
+  return Math.max(candleMs * 2, 2 * 60 * 1000);
+}
+
+function getSriLankaParts(date = new Date()) {
+  const parts = new Intl.DateTimeFormat("en-GB", {
+    timeZone: "Asia/Colombo",
+    weekday: "short",
+    hour: "2-digit",
+    minute: "2-digit",
+    hour12: false
+  }).formatToParts(date);
+  const map = Object.fromEntries(parts.filter(p => p.type !== "literal").map(p => [p.type, p.value]));
+  return { weekday: map.weekday, hour: Number(map.hour || 0), minute: Number(map.minute || 0) };
+}
+
+function getMarketSessionStatus(now = new Date()) {
+  const { weekday, hour, minute } = getSriLankaParts(now);
+  const minutes = hour * 60 + minute;
+  const isDailyPause = minutes >= 150 && minutes < 210;
+  const isWeekendStart = weekday === "Fri" && minutes >= 1320;
+  const isWeekendClosed = weekday === "Sat" || weekday === "Sun";
+  const isMondayEarly = weekday === "Mon" && minutes < 210;
+  const isClosed = isWeekendStart || isWeekendClosed || isMondayEarly || (["Tue", "Wed", "Thu", "Fri"].includes(weekday) && isDailyPause);
+  let caption = "Market open";
+  if (isWeekendStart || isWeekendClosed || isMondayEarly) caption = "Market closed until Monday 03:30 AM SLT";
+  else if (isClosed) caption = "Market closed until 03:30 AM SLT";
+  return { isClosed, caption };
+}
+
+function extractJsonBlock(text) {
+  if (!text) return null;
+  const fenced = text.match(/```json\s*([\s\S]*?)```/i) || text.match(/```\s*([\s\S]*?)```/i);
+  const candidate = fenced ? fenced[1] : text;
+  const start = candidate.indexOf("{");
+  const end = candidate.lastIndexOf("}");
+  if (start === -1 || end === -1 || end <= start) return null;
+  return candidate.slice(start, end + 1);
+}
+
+function normalizePredictionPayload(payload, fallbackPrice, session) {
+  if (!payload || typeof payload !== "object") return null;
+  const entry = Number(payload.entry ?? fallbackPrice);
+  const stop = Number(payload.stop ?? entry);
+  const tp1 = Number(payload.tp1 ?? entry);
+  const tp2 = Number(payload.tp2 ?? tp1);
+  const tp3 = Number(payload.tp3 ?? tp2);
+  const forecast5 = Number(payload.forecast5 ?? tp1);
+  const forecast10 = Number(payload.forecast10 ?? tp2);
+  const confidence = Math.max(0, Math.min(100, Number(payload.confidence ?? 0)));
+  const signal = ["BUY", "SELL", "WAIT"].includes(payload.signal) ? payload.signal : "WAIT";
+  const reasons = Array.isArray(payload.reasons) ? payload.reasons.map(String).slice(0, 6) : [];
+  const risks = Array.isArray(payload.risks) ? payload.risks.map(String).slice(0, 3) : [];
+  const tradeQuality = payload.trade_quality || "C";
+  const rrRatio = Number(payload.rr_ratio ?? 0);
+  const marketBias = payload.market_bias || "Neutral";
+  const newsRisk = payload.news_risk || "Low";
+  const path = signal === "WAIT" || session.isClosed ? [] : Array.from({ length: 5 }, (_, i) => {
+    const ratio = (i + 1) / 5;
+    const p = entry + (forecast5 - entry) * ratio;
+    return { time: Date.now() + (i + 1) * 60000, price: p };
+  });
+  return {
+    generatedAt: Date.now(),
+    horizon: payload.horizon || "5m",
+    signal,
+    confidence,
+    entry,
+    stop,
+    tp1,
+    tp2,
+    tp3,
+    forecast5,
+    forecast10,
+    reasons,
+    risks,
+    tradeQuality,
+    rrRatio,
+    marketBias,
+    newsRisk,
+    path
+  };
+}
+
+function calcAccountPlan(price, levels, balance, lotSize, leverage) {
+  const safeBalance = Math.max(Number(balance) || 0, 0);
+  const safeLot = Math.max(Number(lotSize) || 0, 0);
+  const safeLeverage = Math.max(Number(leverage) || 0, 1);
+  const ozPerLot = 100;
+  const minBrokerLot = 0.01;
+  const notional = price * ozPerLot * safeLot;
+  const marginRequired = safeLot > 0 ? notional / safeLeverage : 0;
+  const stopDistance = Math.abs(price - levels.stop);
+  const tp1Distance = Math.abs(levels.tp1 - price);
+  const tp2Distance = Math.abs(levels.tp2 - price);
+  const riskDollar = stopDistance * ozPerLot * safeLot;
+  const tp1Dollar = tp1Distance * ozPerLot * safeLot;
+  const tp2Dollar = tp2Distance * ozPerLot * safeLot;
+  const minLotRiskDollar = stopDistance * ozPerLot * minBrokerLot;
+  const minLotTp1Dollar = tp1Distance * ozPerLot * minBrokerLot;
+  const minLotTp2Dollar = tp2Distance * ozPerLot * minBrokerLot;
+  const riskPct = safeBalance > 0 ? (riskDollar / safeBalance) * 100 : 0;
+  const marginPct = safeBalance > 0 ? (marginRequired / safeBalance) * 100 : 0;
+  const recommendedRiskPct = 1;
+  const hardRiskPct = 2;
+  const recommendedMaxLoss = safeBalance * (recommendedRiskPct / 100);
+  const hardMaxLoss = safeBalance * (hardRiskPct / 100);
+  const suggestedLot = stopDistance > 0 ? recommendedMaxLoss / (stopDistance * ozPerLot) : 0;
+  const maxSafeLot = stopDistance > 0 ? hardMaxLoss / (stopDistance * ozPerLot) : 0;
+  const optimalRiskDollar = safeBalance * 0.01;
+  const optimalLot = stopDistance > 0
+    ? Math.max(0.01, parseFloat((safeBalance * 0.01 / (stopDistance * ozPerLot)).toFixed(2)))
+    : 0;
+  const finalSuggestedLot = Math.max(0.01, Math.min(optimalLot, maxSafeLot || 0.01));
+  const requiredBalance1Pct = minLotRiskDollar > 0 ? minLotRiskDollar / 0.01 : 0;
+  const requiredBalance2Pct = minLotRiskDollar > 0 ? minLotRiskDollar / 0.02 : 0;
+  const requiredBalance3Pct = minLotRiskDollar > 0 ? minLotRiskDollar / 0.03 : 0;
+  const minLotRiskPct = safeBalance > 0 ? (minLotRiskDollar / safeBalance) * 100 : 0;
+  const walletStatus = safeBalance <= 0
+    ? "ENTER_BALANCE"
+    : minLotRiskPct <= 1
+      ? "COMFORTABLE"
+      : minLotRiskPct <= 3
+        ? "HIGH_BUT_VALID"
+        : "TOO_SMALL";
+  const warnings = [];
+  if (safeBalance <= 0) warnings.push("Enter account balance to validate position risk.");
+  if (safeLot <= 0) warnings.push("Enter lot size to calculate account exposure.");
+  if (riskPct > hardRiskPct) warnings.push("Stop loss risks more than 2% of balance.");
+  else if (riskPct > recommendedRiskPct) warnings.push("Stop loss risks more than the preferred 1% balance rule.");
+  if (safeBalance > 0 && minLotRiskPct > 3) warnings.push("Even the broker minimum 0.01 lot is too large for this setup on your wallet.");
+  if (marginPct > 50) warnings.push("Estimated margin usage is above 50% of account balance.");
+  else if (marginPct > 25) warnings.push("Estimated margin usage is elevated.");
+  const tradable = warnings.length === 0 || warnings.every(w => !/more than 2%|above 50%/.test(w));
+  return {
+    ozPerLot,
+    minBrokerLot,
+    notional,
+    marginRequired,
+    marginPct,
+    riskDollar,
+    riskPct,
+    tp1Dollar,
+    tp2Dollar,
+    minLotRiskDollar,
+    minLotTp1Dollar,
+    minLotTp2Dollar,
+    minLotRiskPct,
+    suggestedLot,
+    maxSafeLot,
+    optimalLot,
+    finalSuggestedLot,
+    requiredBalance1Pct,
+    requiredBalance2Pct,
+    requiredBalance3Pct,
+    walletStatus,
+    warnings,
+    tradable
+  };
+}
+
+function applyRiskGateToSignal(signal, accountPlan) {
+  if (accountPlan.riskPct > 3) return "WAIT";
+  if (accountPlan.marginPct > 60) return "WAIT";
+  if (accountPlan.walletStatus === "TOO_SMALL") return "WAIT";
+  return signal;
+}
+
+async function requestForecastViaProxy(provider, apiKey, model, prompt, systemPrompt) {
+  const response = await fetch("http://127.0.0.1:8787/forecast", {
+    method: "POST",
+    headers: {
+      "Content-Type": "application/json"
+    },
+    body: JSON.stringify({
+      provider,
+      apiKey,
+      model,
+      prompt,
+      systemPrompt
+    })
+  });
+  if (!response.ok) {
+    let message = "Forecast proxy request failed";
+    try {
+      const errorData = await response.json();
+      if (errorData?.error) message = errorData.error;
+    } catch (err) {}
+    throw new Error(message);
+  }
+  const data = await response.json();
+  const text = data.text || "";
+  return text;
+}
+
+async function requestOpenAIForecast(apiKey, model, prompt, systemPrompt) {
+  return requestForecastViaProxy("openai", apiKey, model, prompt, systemPrompt);
+}
+
+async function requestGeminiForecast(apiKey, model, prompt, systemPrompt) {
+  return requestForecastViaProxy("gemini", apiKey, model, prompt, systemPrompt);
+}
+
+async function fetchTwelveDataPrice(apiKey) {
+  const url = "https://api.twelvedata.com/price?symbol=" + encodeURIComponent("XAU/USD") + "&apikey=" + encodeURIComponent(apiKey) + "&dp=2";
+  const response = await fetch(url, { cache: "no-store" });
+  if (!response.ok) throw new Error("Twelve Data request failed");
+  const data = await response.json();
+  const parsed = parseFloat(data.price || 0);
+  if (!(parsed > 1000)) throw new Error(data.message || "Invalid XAU/USD price");
+  return { price: parsed, source: "Twelve Data" };
+}
+
+async function fetchTwelveDataHistory(apiKey, tf) {
+  const intervalMap = {
+    M1: "1min",
+    M5: "5min",
+    M15: "15min",
+    M30: "30min",
+    H1: "1h",
+    H4: "4h",
+    D1: "1day"
+  };
+  const interval = intervalMap[tf] || "5min";
+  const url = "https://api.twelvedata.com/time_series"
+    + "?symbol=XAU/USD"
+    + "&interval=" + interval
+    + "&outputsize=500"
+    + "&apikey=" + encodeURIComponent(apiKey)
+    + "&dp=2"
+    + "&order=ASC";
+  const response = await fetch(url, { cache: "no-store" });
+  if (!response.ok) throw new Error("Twelve Data history request failed");
+  const data = await response.json();
+  if (!data.values || !Array.isArray(data.values)) {
+    throw new Error(data.message || "No historical data returned");
+  }
+  return data.values.map(bar => {
+    const raw = bar.datetime;
+    const isoUtc = raw.includes("T") ? raw : raw.replace(" ", "T") + "Z";
+    const time = new Date(isoUtc).getTime();
+    return {
+      time,
+      open: parseFloat(bar.open),
+      high: parseFloat(bar.high),
+      low: parseFloat(bar.low),
+      close: parseFloat(bar.close)
+    };
+  }).filter(candle =>
+    candle.open > 100 && candle.high > 100 &&
+    Number.isFinite(candle.time) && candle.time > 0
+  );
+}
+
+async function fetchPublicHistory(tf) {
+  const intervalMap = {
+    M1: "1m",
+    M5: "5m",
+    M15: "15m",
+    M30: "30m",
+    H1: "1h",
+    H4: "1h",
+    D1: "1d"
+  };
+  const rangeMap = {
+    M1: "5d",
+    M5: "5d",
+    M15: "5d",
+    M30: "5d",
+    H1: "30d",
+    H4: "60d",
+    D1: "1y"
+  };
+  const interval = intervalMap[tf] || "5m";
+  const range = rangeMap[tf] || "5d";
+  const url = "https://query1.finance.yahoo.com/v8/finance/chart/GC%3DF"
+    + "?interval=" + interval
+    + "&range=" + range
+    + "&includePrePost=false";
+  const response = await fetch(url, { cache: "no-store" });
+  if (!response.ok) throw new Error("Public history fetch failed");
+  const data = await response.json();
+  const result = data?.chart?.result?.[0];
+  if (!result) throw new Error("No public history data");
+  const timestamps = result.timestamp || [];
+  const quotes = result.indicators?.quote?.[0] || {};
+  return timestamps.map((t, i) => ({
+    time: t * 1000,
+    open: parseFloat(((quotes.open?.[i]) || 0).toFixed(2)),
+    high: parseFloat(((quotes.high?.[i]) || 0).toFixed(2)),
+    low: parseFloat(((quotes.low?.[i]) || 0).toFixed(2)),
+    close: parseFloat(((quotes.close?.[i]) || 0).toFixed(2))
+  })).filter(candle => candle.open > 100 && candle.high > 100 && candle.close > 100);
+}
+
+function beep(freq = 880, dur = 1.5, type = "triangle") {
+  try {
+    const ctx = new (window.AudioContext || window.webkitAudioContext)();
+    const osc = ctx.createOscillator();
+    const gain = ctx.createGain();
+    osc.connect(gain);
+    gain.connect(ctx.destination);
+    osc.type = type;
+    osc.frequency.setValueAtTime(freq, ctx.currentTime);
+    gain.gain.setValueAtTime(0.22, ctx.currentTime);
+    gain.gain.exponentialRampToValueAtTime(0.001, ctx.currentTime + dur);
+    osc.start();
+    osc.stop(ctx.currentTime + dur);
+  } catch (err) {}
+}
+
+function genHistory(base, count = 300) {
+  let p = base * (0.994 + Math.random() * 0.004);
+  const now = Date.now();
+  return Array.from({ length: count }, (_, i) => {
+    const open = p;
+    const vol = base * 0.001 * (0.45 + Math.random());
+    const high = open + vol * (0.4 + Math.random() * 0.8);
+    const low = open - vol * (0.4 + Math.random() * 0.8);
+    const close = low + (high - low) * Math.random();
+    p = close;
+    return { time: now - (count - 1 - i) * BASE_CANDLE_MS, open, high, low, close };
+  });
+}
+
+function aggregateHistory(history, tf) {
+  const group = TF_CONFIG[tf]?.group || 1;
+  if (group <= 1) return history.slice();
+  const out = [];
+  for (let i = 0; i < history.length; i += group) {
+    const chunk = history.slice(i, i + group);
+    if (!chunk.length) continue;
+    out.push({
+      time: chunk[chunk.length - 1].time,
+      open: chunk[0].open,
+      high: Math.max(...chunk.map(c => c.high)),
+      low: Math.min(...chunk.map(c => c.low)),
+      close: chunk[chunk.length - 1].close
+    });
+  }
+  return out;
+}
+
+function calcRSI(arr, p = 14) {
+  if (arr.length < p + 1) return 50;
+  let gains = 0;
+  let losses = 0;
+  for (let i = arr.length - p; i < arr.length; i++) {
+    const delta = arr[i].close - arr[i - 1].close;
+    if (delta > 0) gains += delta;
+    else losses -= delta;
+  }
+  const avgGain = gains / p;
+  const avgLoss = losses / p;
+  if (avgLoss === 0) return 100;
+  return +(100 - 100 / (1 + avgGain / avgLoss)).toFixed(2);
+}
+
+function calcEMAFromValues(values, p) {
+  if (!values.length) return [];
+  const k = 2 / (p + 1);
+  const ema = [values[0]];
+  for (let i = 1; i < values.length; i++) ema.push(values[i] * k + ema[i - 1] * (1 - k));
+  return ema;
+}
+
+function calcEMA(arr, p) {
+  const values = arr.map(x => x.close);
+  const series = calcEMAFromValues(values, p);
+  return series.length ? series[series.length - 1] : 0;
+}
+
+function calcMACD(arr) {
+  const closes = arr.map(x => x.close);
+  if (closes.length < 35) {
+    return {
+      macd: 0,
+      signal: 0,
+      histogram: 0,
+      previousMacd: 0,
+      previousSignal: 0,
+      series: []
+    };
+  }
+  const ema12Series = calcEMAFromValues(closes, 12);
+  const ema26Series = calcEMAFromValues(closes, 26);
+  const macdSeries = closes.map((_, i) => ema12Series[i] - ema26Series[i]);
+  const signalSeries = calcEMAFromValues(macdSeries, 9);
+  const histogramSeries = macdSeries.map((value, i) => value - signalSeries[i]);
+  const series = arr.map((candle, i) => ({
+    time: candle.time,
+    macd: macdSeries[i],
+    signal: signalSeries[i],
+    histogram: histogramSeries[i]
+  }));
+  const last = series[series.length - 1];
+  const previous = series[series.length - 2] || last;
+  return {
+    macd: last.macd,
+    signal: last.signal,
+    histogram: last.histogram,
+    previousMacd: previous.macd,
+    previousSignal: previous.signal,
+    series
+  };
+}
+
+function calcBB(arr, p = 20) {
+  if (arr.length < p) {
+    const close = arr[arr.length - 1]?.close || 0;
+    return { upper: close, middle: close, lower: close };
+  }
+  const closes = arr.slice(-p).map(x => x.close);
+  const middle = closes.reduce((a, b) => a + b, 0) / p;
+  const sd = Math.sqrt(closes.reduce((a, b) => a + (b - middle) ** 2, 0) / p);
+  return { upper: middle + 2 * sd, middle, lower: middle - 2 * sd };
+}
+
+function calcATR(arr, p = 14) {
+  if (arr.length < p + 1) return 0;
+  const sample = arr.slice(-p - 1);
+  const trs = sample.map((x, i, all) => i === 0 ? 0 : Math.max(
+    x.high - x.low,
+    Math.abs(x.high - all[i - 1].close),
+    Math.abs(x.low - all[i - 1].close)
+  ));
+  return trs.slice(1).reduce((a, b) => a + b, 0) / p;
+}
+
+function calcRMA(values, p) {
+  if (!values.length) return [];
+  const out = [values[0]];
+  for (let i = 1; i < values.length; i++) out.push((out[i - 1] * (p - 1) + values[i]) / p);
+  return out;
+}
+
+function calcDMI(arr, p = 14) {
+  if (arr.length < p + 2) {
+    return { plusDI: 0, minusDI: 0, adx: 0, dx: 0 };
+  }
+  const tr = [];
+  const plusDM = [];
+  const minusDM = [];
+  for (let i = 1; i < arr.length; i++) {
+    const upMove = arr[i].high - arr[i - 1].high;
+    const downMove = arr[i - 1].low - arr[i].low;
+    plusDM.push(upMove > downMove && upMove > 0 ? upMove : 0);
+    minusDM.push(downMove > upMove && downMove > 0 ? downMove : 0);
+    tr.push(Math.max(
+      arr[i].high - arr[i].low,
+      Math.abs(arr[i].high - arr[i - 1].close),
+      Math.abs(arr[i].low - arr[i - 1].close)
+    ));
+  }
+  const trRma = calcRMA(tr, p);
+  const plusRma = calcRMA(plusDM, p);
+  const minusRma = calcRMA(minusDM, p);
+  const dxSeries = trRma.map((trVal, i) => {
+    const plus = trVal ? (plusRma[i] / trVal) * 100 : 0;
+    const minus = trVal ? (minusRma[i] / trVal) * 100 : 0;
+    const denom = plus + minus;
+    return denom ? (Math.abs(plus - minus) / denom) * 100 : 0;
+  });
+  const adxSeries = calcRMA(dxSeries, p);
+  const lastIndex = dxSeries.length - 1;
+  return {
+    plusDI: trRma[lastIndex] ? (plusRma[lastIndex] / trRma[lastIndex]) * 100 : 0,
+    minusDI: trRma[lastIndex] ? (minusRma[lastIndex] / trRma[lastIndex]) * 100 : 0,
+    dx: dxSeries[lastIndex] || 0,
+    adx: adxSeries[adxSeries.length - 1] || 0
+  };
+}
+
+function calcVWAP(history) {
+  const sample = history.slice(-390);
+  if (sample.length < 2) return history[history.length - 1]?.close || 0;
+  let cumPV = 0;
+  let cumVol = 0;
+  sample.forEach(c => {
+    const typical = (c.high + c.low + c.close) / 3;
+    const vol = Math.max(c.high - c.low, 0.01);
+    cumPV += typical * vol;
+    cumVol += vol;
+  });
+  return cumVol > 0 ? cumPV / cumVol : sample[sample.length - 1].close;
+}
+
+function calcOBV(history) {
+  const sample = history.slice(-50);
+  if (sample.length < 2) return { obv: 0, trend: "neutral" };
+  let obv = 0;
+  const obvSeries = [0];
+  for (let i = 1; i < sample.length; i++) {
+    const vol = Math.max(sample[i].high - sample[i].low, 0.01) * 100;
+    if (sample[i].close > sample[i - 1].close) obv += vol;
+    else if (sample[i].close < sample[i - 1].close) obv -= vol;
+    obvSeries.push(obv);
+  }
+  const recent5 = obvSeries.slice(-5);
+  const obvSlope = recent5[recent5.length - 1] - recent5[0];
+  return {
+    obv,
+    trend: obvSlope > 0 ? "rising" : obvSlope < 0 ? "falling" : "flat"
+  };
+}
+
+function calcFibLevels(history, lookback = 100) {
+  const sample = history.slice(-lookback);
+  if (sample.length < 10) return null;
+  const swing_high = Math.max(...sample.map(c => c.high));
+  const swing_low = Math.min(...sample.map(c => c.low));
+  const range = swing_high - swing_low;
+  return {
+    swing_high,
+    swing_low,
+    fib236: swing_high - range * 0.236,
+    fib382: swing_high - range * 0.382,
+    fib500: swing_high - range * 0.500,
+    fib618: swing_high - range * 0.618,
+    fib786: swing_high - range * 0.786
+  };
+}
+
+function calcIchimoku(history) {
+  if (history.length < 52) return null;
+  const hi = arr => Math.max(...arr.map(c => c.high));
+  const lo = arr => Math.min(...arr.map(c => c.low));
+  const tenkan = (hi(history.slice(-9)) + lo(history.slice(-9))) / 2;
+  const kijun = (hi(history.slice(-26)) + lo(history.slice(-26))) / 2;
+  const senkouA = (tenkan + kijun) / 2;
+  const senkouB = (hi(history.slice(-52)) + lo(history.slice(-52))) / 2;
+  const price = history[history.length - 1].close;
+  const aboveCloud = price > Math.max(senkouA, senkouB);
+  const belowCloud = price < Math.min(senkouA, senkouB);
+  const bullishTK = tenkan > kijun;
+  return { tenkan, kijun, senkouA, senkouB, aboveCloud, belowCloud, bullishTK };
+}
+
+function calcPivotPoints(history) {
+  const sample = history.slice(-20);
+  if (sample.length < 5) return null;
+  const H = Math.max(...sample.map(c => c.high));
+  const L = Math.min(...sample.map(c => c.low));
+  const C = sample[sample.length - 1].close;
+  const P = (H + L + C) / 3;
+  return {
+    P,
+    R1: 2 * P - L,
+    R2: P + (H - L),
+    R3: H + 2 * (P - L),
+    S1: 2 * P - H,
+    S2: P - (H - L),
+    S3: L - 2 * (H - P)
+  };
+}
+
+function detectCandlePatterns(history) {
+  const patterns = [];
+  const len = history.length;
+  if (len < 3) return patterns;
+  const [c3, c2, c1] = history.slice(-3);
+  const body1 = Math.abs(c1.close - c1.open);
+  const range1 = c1.high - c1.low;
+  const bull1 = c1.close > c1.open;
+  const bull2 = c2.close > c2.open;
+
+  if (body1 < range1 * 0.1 && range1 > 0) patterns.push({ name: "Doji", dir: "neutral", strength: "moderate" });
+  if (bull1 && (c1.low < c1.open - body1 * 2) && body1 > 0) patterns.push({ name: "Hammer", dir: "buy", strength: "moderate" });
+  if ((c1.high > c1.close + body1 * 2) && body1 > 0) patterns.push({ name: "Shooting Star", dir: "sell", strength: "moderate" });
+  if (!bull2 && bull1 && c1.open < c2.close && c1.close > c2.open) patterns.push({ name: "Bullish Engulfing", dir: "buy", strength: "strong" });
+  if (bull2 && !bull1 && c1.open > c2.close && c1.close < c2.open) patterns.push({ name: "Bearish Engulfing", dir: "sell", strength: "strong" });
+  if (c3.close > c3.open && c2.close > c2.open && c1.close > c1.open && c2.close > c3.close && c1.close > c2.close) patterns.push({ name: "Three White Soldiers", dir: "buy", strength: "strong" });
+  if (c3.close < c3.open && c2.close < c2.open && c1.close < c1.open && c2.close < c3.close && c1.close < c2.close) patterns.push({ name: "Three Black Crows", dir: "sell", strength: "strong" });
+  return patterns;
+}
+
+function findPivotLevels(history, left = 2, right = 2, lookback = 80) {
+  const sample = history.slice(-lookback);
+  const pivots = [];
+  for (let i = left; i < sample.length - right; i++) {
+    const current = sample[i];
+    let pivotHigh = true;
+    let pivotLow = true;
+    for (let j = i - left; j <= i + right; j++) {
+      if (j === i) continue;
+      if (sample[j].high >= current.high) pivotHigh = false;
+      if (sample[j].low <= current.low) pivotLow = false;
+    }
+    if (pivotHigh) pivots.push({ type: "high", price: current.high, time: current.time });
+    if (pivotLow) pivots.push({ type: "low", price: current.low, time: current.time });
+  }
+  return pivots;
+}
+
+function calcStoch(arr, p = 14) {
+  if (arr.length < p) return 50;
+  const sample = arr.slice(-p);
+  const high = Math.max(...sample.map(x => x.high));
+  const low = Math.min(...sample.map(x => x.low));
+  if (high === low) return 50;
+  return +(((arr[arr.length - 1].close - low) / (high - low)) * 100).toFixed(2);
+}
+
+function getIndicators(history, price) {
+  if (history.length < 55) return null;
+  const vwap = calcVWAP(history);
+  const obv = calcOBV(history);
+  const fib = calcFibLevels(history);
+  const ichimoku = calcIchimoku(history);
+  const pivots = calcPivotPoints(history);
+  const patterns = detectCandlePatterns(history);
+  return {
+    rsi: calcRSI(history),
+    macd: calcMACD(history),
+    bb: calcBB(history),
+    atr: calcATR(history),
+    dmi: calcDMI(history),
+    stoch: calcStoch(history),
+    ema21: calcEMA(history.slice(-21), 21),
+    ema50: calcEMA(history.slice(-50), 50),
+    ema200: calcEMA(history.slice(-200), 200),
+    vwap,
+    obv,
+    fib,
+    ichimoku,
+    pivots,
+    patterns,
+    price
+  };
+}
+
+function clamp(val, min, max) {
+  return Math.max(min, Math.min(max, val));
+}
+
+function getSignal(ind, price) {
+  if (!ind) return { signal: "WAIT", buyScore: 0, sellScore: 0, confidence: 50, reasons: [], bias: "Neutral", setup: "No data" };
+  const { rsi, macd, bb, stoch, ema21, ema50, atr, dmi } = ind;
+  let buyScore = 0;
+  let sellScore = 0;
+  const reasons = [];
+
+  const trendUp = price > ema21 && ema21 > ema50;
+  const trendDown = price < ema21 && ema21 < ema50;
+  const trendMixed = !trendUp && !trendDown;
+  const adxStrong = dmi.adx >= 20;
+  const adxWeak = dmi.adx < 16;
+  const bullishDMI = dmi.plusDI > dmi.minusDI;
+  const bearishDMI = dmi.minusDI > dmi.plusDI;
+  const priceAboveBothEMAs = price > ema21 && price > ema50;
+  const priceBelowBothEMAs = price < ema21 && price < ema50;
+
+  if (trendUp && priceAboveBothEMAs) {
+    buyScore += 3;
+    reasons.push({ dir: "buy", text: "Price above EMA21 and EMA50 - bullish trend stack" });
+  } else if (trendDown && priceBelowBothEMAs) {
+    sellScore += 3;
+    reasons.push({ dir: "sell", text: "Price below EMA21 and EMA50 - bearish trend stack" });
+  } else {
+    reasons.push({ dir: "neutral", text: "Trend structure is mixed - conviction is lower" });
+  }
+
+  const hardBuyVeto = priceBelowBothEMAs;
+  const hardSellVeto = priceAboveBothEMAs;
+
+  if (adxStrong && bullishDMI) { buyScore += 3; reasons.push({ dir: "buy", text: "ADX trend strength supports buyers (+DI > -DI)" }); }
+  else if (adxStrong && bearishDMI) { sellScore += 3; reasons.push({ dir: "sell", text: "ADX trend strength supports sellers (-DI > +DI)" }); }
+  else if (adxWeak) { reasons.push({ dir: "neutral", text: "ADX is weak, so breakout quality is limited" }); }
+
+  const macdAboveSignal = macd.macd > macd.signal;
+  const macdBelowSignal = macd.macd < macd.signal;
+  const bullishCross = macd.previousMacd <= macd.previousSignal && macd.macd > macd.signal;
+  const bearishCross = macd.previousMacd >= macd.previousSignal && macd.macd < macd.signal;
+  const macdLevel = macd.macd;
+  const macdStronglyNegative = macdLevel < -3.0;
+  const macdStronglyPositive = macdLevel > 3.0;
+
+  if (bullishCross && !macdStronglyNegative) {
+    buyScore += 3;
+    reasons.push({ dir: "buy", text: "MACD bullish crossover (12,26,9)" });
+  } else if (bearishCross && !macdStronglyPositive) {
+    sellScore += 3;
+    reasons.push({ dir: "sell", text: "MACD bearish crossover (12,26,9)" });
+  } else if (macdAboveSignal && !macdStronglyNegative) {
+    buyScore += 2;
+    reasons.push({ dir: "buy", text: "MACD above signal line" });
+  } else if (macdBelowSignal || macdStronglyNegative) {
+    sellScore += 2;
+    reasons.push({ dir: "sell", text: "MACD below signal line" });
+  }
+
+  if (macdStronglyNegative) {
+    sellScore += 2;
+    reasons.push({ dir: "sell", text: "MACD value deeply negative - strong downward momentum" });
+  }
+  if (macdStronglyPositive) {
+    buyScore += 2;
+    reasons.push({ dir: "buy", text: "MACD value strongly positive - strong upward momentum" });
+  }
+
+  if (macd.histogram > 0 && macd.histogram > (macd.series[macd.series.length - 2]?.histogram ?? macd.histogram)) {
+    buyScore += 1;
+    reasons.push({ dir: "buy", text: "MACD histogram expanding upward" });
+  } else if (macd.histogram < 0 && macd.histogram < (macd.series[macd.series.length - 2]?.histogram ?? macd.histogram)) {
+    sellScore += 1;
+    reasons.push({ dir: "sell", text: "MACD histogram expanding downward" });
+  }
+
+  if (trendUp && rsi >= 52 && rsi <= 68) { buyScore += 2; reasons.push({ dir: "buy", text: "RSI supports bullish continuation (" + rsi.toFixed(0) + ")" }); }
+  else if (trendDown && rsi >= 32 && rsi <= 48) { sellScore += 2; reasons.push({ dir: "sell", text: "RSI supports bearish continuation (" + rsi.toFixed(0) + ")" }); }
+  else if (rsi < 28 && !trendDown) { buyScore += 1; reasons.push({ dir: "buy", text: "RSI is stretched lower and may mean-revert" }); }
+  else if (rsi > 72 && !trendUp) { sellScore += 1; reasons.push({ dir: "sell", text: "RSI is stretched higher and may mean-revert" }); }
+
+  if (stoch > 85) {
+    sellScore += 3;
+    reasons.push({ dir: "sell", text: "Stochastic extremely overbought (" + stoch.toFixed(0) + ") - reversal risk high" });
+  } else if (stoch < 15) {
+    buyScore += 3;
+    reasons.push({ dir: "buy", text: "Stochastic extremely oversold (" + stoch.toFixed(0) + ") - reversal opportunity" });
+  } else if (trendUp && stoch > 45 && stoch < 80) {
+    buyScore += 1;
+    reasons.push({ dir: "buy", text: "Stochastic in bullish continuation zone (" + stoch.toFixed(0) + ")" });
+  } else if (trendDown && stoch < 55 && stoch > 20) {
+    sellScore += 1;
+    reasons.push({ dir: "sell", text: "Stochastic in bearish continuation zone (" + stoch.toFixed(0) + ")" });
+  }
+
+  const bbRange = Math.max(bb.upper - bb.lower, 0.0001);
+  const bbPos = (price - bb.lower) / bbRange;
+  if (trendUp && bbPos > 0.55 && bbPos < 0.92) { buyScore += 1; reasons.push({ dir: "buy", text: "Price is holding the upper Bollinger half" }); }
+  else if (trendDown && bbPos < 0.45 && bbPos > 0.08) { sellScore += 1; reasons.push({ dir: "sell", text: "Price is holding the lower Bollinger half" }); }
+
+  if (ind.vwap) {
+    if (price > ind.vwap && trendUp) {
+      buyScore += 2;
+      reasons.push({ dir: "buy", text: "Price trading above VWAP - institutional buy pressure" });
+    } else if (price < ind.vwap && trendDown) {
+      sellScore += 2;
+      reasons.push({ dir: "sell", text: "Price trading below VWAP - institutional sell pressure" });
+    }
+  }
+
+  if (ind.obv) {
+    if (ind.obv.trend === "rising" && trendUp) {
+      buyScore += 1;
+      reasons.push({ dir: "buy", text: "OBV rising - volume confirms bullish move" });
+    } else if (ind.obv.trend === "falling" && trendDown) {
+      sellScore += 1;
+      reasons.push({ dir: "sell", text: "OBV falling - volume confirms bearish move" });
+    } else if ((ind.obv.trend === "falling" && trendUp) || (ind.obv.trend === "rising" && trendDown)) {
+      reasons.push({ dir: "neutral", text: "OBV diverging from price - reduced conviction" });
+      buyScore = Math.max(0, buyScore - 1);
+      sellScore = Math.max(0, sellScore - 1);
+    }
+  }
+
+  if (ind.ichimoku) {
+    const { aboveCloud, belowCloud, bullishTK } = ind.ichimoku;
+    if (aboveCloud && bullishTK) {
+      buyScore += 2;
+      reasons.push({ dir: "buy", text: "Ichimoku: price above cloud with bullish TK cross" });
+    } else if (belowCloud && !bullishTK) {
+      sellScore += 2;
+      reasons.push({ dir: "sell", text: "Ichimoku: price below cloud with bearish TK alignment" });
+    }
+  }
+
+  if (ind.ema200) {
+    if (price > ind.ema200) {
+      buyScore += 1;
+      reasons.push({ dir: "buy", text: "Price above EMA200 - long-term uptrend intact" });
+    } else {
+      sellScore += 1;
+      reasons.push({ dir: "sell", text: "Price below EMA200 - long-term downtrend pressure" });
+    }
+  }
+
+  if (ind.patterns && ind.patterns.length > 0) {
+    ind.patterns.forEach(p => {
+      if (p.dir === "buy") {
+        const pts = p.strength === "strong" ? 2 : 1;
+        buyScore += pts;
+        reasons.push({ dir: "buy", text: "Pattern: " + p.name + " detected (" + p.strength + " signal)" });
+      } else if (p.dir === "sell") {
+        const pts = p.strength === "strong" ? 2 : 1;
+        sellScore += pts;
+        reasons.push({ dir: "sell", text: "Pattern: " + p.name + " detected (" + p.strength + " signal)" });
+      } else {
+        reasons.push({ dir: "neutral", text: "Pattern: " + p.name + " - indecision candle, wait for confirmation" });
+      }
+    });
+  }
+
+  if (ind.fib) {
+    const fib = ind.fib;
+    const nearFib = level => Math.abs(price - level) < ind.atr * 0.5;
+    if (nearFib(fib.fib618) && trendUp) {
+      buyScore += 2;
+      reasons.push({ dir: "buy", text: "Price at 61.8% Fibonacci support - key reversal zone" });
+    } else if (nearFib(fib.fib382) && trendDown) {
+      sellScore += 2;
+      reasons.push({ dir: "sell", text: "Price at 38.2% Fibonacci resistance - pullback rejection zone" });
+    } else if (nearFib(fib.fib500)) {
+      reasons.push({ dir: "neutral", text: "Price at 50% Fibonacci mid-level - wait for directional break" });
+    }
+  }
+
+  if (atr > 0 && atr / price > 0.005) reasons.push({ dir: "neutral", text: "Volatility elevated, widen stops" });
+
+  const total = buyScore + sellScore;
+  const dominance = total > 0 ? Math.max(buyScore, sellScore) / total : 0.5;
+  const confidence = Math.round(clamp(
+    dominance * 70 + Math.min(dmi.adx, 40) * 0.55 + (total > 12 ? 5 : 0),
+    30, 97
+  ));
+  let signal = "WAIT";
+  if (buyScore >= 8 && buyScore - sellScore >= 3 && dmi.adx >= 18) signal = "BUY";
+  if (sellScore >= 8 && sellScore - buyScore >= 3 && dmi.adx >= 18) signal = "SELL";
+  if (dmi.adx < 14) signal = "WAIT";
+  if (Math.abs(rsi - 50) < 5 && signal !== "WAIT") signal = "WAIT";
+
+  if (hardBuyVeto && signal === "BUY") {
+    signal = "WAIT";
+    reasons.push({ dir: "neutral", text: "BUY vetoed - price is below both EMA21 and EMA50" });
+  }
+  if (hardSellVeto && signal === "SELL") {
+    signal = "WAIT";
+    reasons.push({ dir: "neutral", text: "SELL vetoed - price is above both EMA21 and EMA50" });
+  }
+  if (confidence < 65 && signal !== "WAIT") signal = "WAIT";
+
+  return {
+    signal,
+    buyScore,
+    sellScore,
+    confidence,
+    reasons,
+    bias: buyScore > sellScore ? "Bullish" : sellScore > buyScore ? "Bearish" : "Neutral",
+    setup: adxStrong ? "Trend" : adxWeak ? "Range" : "Transition"
+  };
+}
+
+function getLevels(history, price, ind, analysis) {
+  const atr = ind?.atr || price * 0.005;
+  const recent = history.slice(-40);
+  const support = recent.length ? Math.min(...recent.map(c => c.low)) : price - atr;
+  const resistance = recent.length ? Math.max(...recent.map(c => c.high)) : price + atr;
+  const pivots = findPivotLevels(history, 2, 2, 80);
+  const pivotLow = [...pivots].reverse().find(p => p.type === "low" && p.price < price)?.price ?? support;
+  const pivotHigh = [...pivots].reverse().find(p => p.type === "high" && p.price > price)?.price ?? resistance;
+  const isBuy = analysis.signal === "BUY";
+  const isSell = analysis.signal === "SELL";
+  const structureTarget = isBuy ? pivotHigh : isSell ? pivotLow : price;
+  const minStopDistance = Math.max(atr * 1.8, 20);
+  const fallbackStop = isBuy
+    ? price - minStopDistance
+    : isSell
+      ? price + minStopDistance
+      : price;
+  const stop = isBuy
+    ? Math.min(fallbackStop, pivotLow - atr * 0.5)
+    : isSell
+      ? Math.max(fallbackStop, pivotHigh + atr * 0.5)
+      : price;
+  const risk = Math.max(Math.abs(price - stop), atr * 1.5, 20);
+  const tp1 = isBuy
+    ? Math.max(pivotHigh, price + risk * 1.8)
+    : isSell
+      ? Math.min(pivotLow, price - risk * 1.8)
+      : price;
+  const tp2 = isBuy
+    ? price + risk * 3.2
+    : isSell
+      ? price - risk * 3.2
+      : price;
+  const rr = risk > 0 ? Math.abs(tp1 - price) / risk : 0;
+  const planReasons = [];
+  if (analysis.signal !== "WAIT" && rr < 1.5) planReasons.push("Nearest target does not offer enough reward relative to stop distance.");
+  if (ind?.dmi?.adx < 16 && analysis.signal !== "WAIT") planReasons.push("Trend strength is weak, so breakouts are less reliable.");
+  const tradable = analysis.signal !== "WAIT" && rr >= 1.5 && (ind?.dmi?.adx ?? 0) >= 14;
+  return {
+    atr,
+    support,
+    resistance,
+    pivotLow,
+    pivotHigh,
+    stop,
+    tp1,
+    tp2,
+    rr,
+    tradable,
+    planReasons,
+    signal: tradable ? analysis.signal : "WAIT",
+    confidence: tradable ? analysis.confidence : Math.min(analysis.confidence, 45)
+  };
+}
+
+function getMarketState(history, price, ind, analysis, tf) {
+  const closes = history.slice(-12).map(c => c.close);
+  const momentum = closes.length > 1 ? ((closes[closes.length - 1] - closes[0]) / closes[0]) * 100 : 0;
+  const atrPct = ind?.atr ? (ind.atr / price) * 100 : 0;
+  const trend = ind ? (price > ind.ema21 && ind.ema21 > ind.ema50 ? "Uptrend" : price < ind.ema21 && ind.ema21 < ind.ema50 ? "Downtrend" : "Range") : "Range";
+  const vol = atrPct > 0.6 ? "High" : atrPct > 0.35 ? "Medium" : "Low";
+  const quality = analysis.confidence >= 72 && analysis.signal !== "WAIT" ? "A-grade" : analysis.confidence >= 60 ? "B-grade" : "C-grade";
+  return { tf, trend, volatility: vol, momentum, quality, atrPct };
+}
+
+const MTF_CACHE = { M5: null, M15: null, H1: null, lastUpdate: 0 };
+
+function getMultiTimeframeConfluence(history, price) {
+  const tfGroups = { M5: 5, M15: 15, H1: 60 };
+  const results = {};
+
+  Object.entries(tfGroups).forEach(([tfLabel]) => {
+    const aggregated = aggregateHistory(history, tfLabel);
+    if (aggregated.length < 55) {
+      results[tfLabel] = "WAIT";
+      return;
+    }
+    const ind = getIndicators(aggregated, aggregated[aggregated.length - 1].close);
+    const sig = getSignal(ind, aggregated[aggregated.length - 1].close);
+    results[tfLabel] = sig.signal;
+  });
+
+  const votes = Object.values(results);
+  const buyVotes = votes.filter(v => v === "BUY").length;
+  const sellVotes = votes.filter(v => v === "SELL").length;
+
+  let confluence = "NONE";
+  let confluenceScore = 0;
+  if (buyVotes === 3) { confluence = "STRONG_BUY"; confluenceScore = 100; }
+  else if (buyVotes === 2) { confluence = "BUY"; confluenceScore = 67; }
+  else if (sellVotes === 3) { confluence = "STRONG_SELL"; confluenceScore = 100; }
+  else if (sellVotes === 2) { confluence = "SELL"; confluenceScore = 67; }
+  else { confluence = "MIXED"; confluenceScore = 0; }
+
+  return {
+    M5: results.M5 || "WAIT",
+    M15: results.M15 || "WAIT",
+    H1: results.H1 || "WAIT",
+    confluence,
+    confluenceScore,
+    aligned: confluenceScore >= 67
+  };
+}
+
+function buildPrediction(history, ind, levels, marketState, tf, session) {
+  if (session.isClosed) {
+    return {
+      generatedAt: Date.now(),
+      horizon: "5m",
+      signal: "WAIT",
+      confidence: 0,
+      entry: history[history.length - 1]?.close || 0,
+      stop: history[history.length - 1]?.close || 0,
+      tp1: history[history.length - 1]?.close || 0,
+      tp2: history[history.length - 1]?.close || 0,
+      tp3: history[history.length - 1]?.close || 0,
+      forecast5: history[history.length - 1]?.close || 0,
+      forecast10: history[history.length - 1]?.close || 0,
+      reasons: ["Market is closed, so prediction is paused until the next session opens."],
+      risks: [],
+      tradeQuality: "SKIP",
+      rrRatio: 0,
+      marketBias: "Neutral",
+      newsRisk: "Low",
+      path: []
+    };
+  }
+  if (!ind || history.length < 30) return null;
+  const last = history[history.length - 1];
+  const previous = history[history.length - 2] || last;
+  const closes = history.slice(-10).map(c => c.close);
+  const momentum5 = closes.length >= 5 ? closes[closes.length - 1] - closes[closes.length - 5] : 0;
+  const momentum10 = closes.length >= 10 ? closes[closes.length - 1] - closes[0] : 0;
+  const bodyBias = history.slice(-6).reduce((sum, candle) => sum + Math.sign(candle.close - candle.open), 0) / 6;
+  const atr = Math.max(ind.atr || last.close * 0.002, 0.01);
+  const macdDelta = ind.macd.macd - ind.macd.signal;
+  const histSlope = ind.macd.histogram - (ind.macd.series[ind.macd.series.length - 2]?.histogram || 0);
+  const trendBias = (last.close > ind.ema21 ? 0.8 : -0.8) + (ind.ema21 > ind.ema50 ? 1 : -1);
+  const rsiBias = (ind.rsi - 50) / 18;
+  const momentumBias = (momentum5 / atr) * 0.9 + (momentum10 / atr) * 0.45;
+  const breakoutBias = last.close > levels.resistance - atr * 0.18 ? 1.2 : last.close < levels.support + atr * 0.18 ? -1.2 : 0;
+  const macdBias = (macdDelta / Math.max(Math.abs(ind.macd.signal), 0.2)) * 1.7 + (histSlope / Math.max(atr * 0.08, 0.01)) * 0.35;
+  const score = trendBias + rsiBias + momentumBias + breakoutBias + macdBias + bodyBias;
+  const absScore = Math.abs(score);
+  const direction = score > 1.35 ? 1 : score < -1.35 ? -1 : 0;
+  let signal = direction > 0 ? "BUY" : direction < 0 ? "SELL" : "WAIT";
+  const confidence = direction === 0 ? Math.min(58, Math.round(42 + absScore * 7)) : Math.max(55, Math.min(93, Math.round(56 + absScore * 8)));
+  const impulse5 = atr * (0.35 + Math.min(absScore, 4) * 0.1);
+  const impulse10 = atr * (0.58 + Math.min(absScore, 4) * 0.14);
+  const forecast5 = last.close + direction * impulse5;
+  const forecast10 = last.close + direction * impulse10;
+  const stop = direction >= 0
+    ? last.close - Math.max(atr * 1.5, atr * 1.2)
+    : last.close + Math.max(atr * 1.5, atr * 1.2);
+  const tp1 = direction >= 0 ? forecast5 : forecast5;
+  const tp2 = direction >= 0 ? forecast10 : forecast10;
+  const tp3 = direction >= 0 ? last.close + direction * atr * 2.9 : last.close + direction * atr * 2.9;
+  const reasons = [];
+  reasons.push("MACD " + (macdDelta >= 0 ? "leans bullish" : "leans bearish") + " with histogram " + (histSlope >= 0 ? "improving" : "weakening") + ".");
+  reasons.push("Short-term momentum over the last 5 to 10 bars is " + (momentum10 >= 0 ? "positive" : "negative") + ".");
+  reasons.push("Trend structure is " + marketState.trend.toLowerCase() + " and volatility is " + marketState.volatility.toLowerCase() + ".");
+  reasons.push(direction === 0 ? "Setup lacks enough edge for a strong directional trade right now." : "Projection favors a " + signal + " continuation over the next 5 to 10 minutes.");
+  reasons.push("Macro news and US data are not yet connected to this local forecast engine, so this projection is based on live chart structure and indicators only.");
+  if (!levels.tradable) {
+    signal = "WAIT";
+    reasons.unshift("Trade quality is reduced because structure or reward-to-risk is not strong enough.");
+  }
+  const futureStepMs = 60000;
+  const path = direction === 0 ? [] : Array.from({ length: 5 }, (_, i) => {
+    const step = i + 1;
+    const ratio = step / 5;
+    const curved = last.close + direction * impulse5 * (ratio * (0.82 + ratio * 0.18));
+    return { time: last.time + futureStepMs * step, price: curved };
+  });
+  return {
+    generatedAt: Date.now(),
+    horizon: "5m",
+    signal,
+    confidence,
+    entry: last.close,
+    stop,
+    tp1,
+    tp2,
+    tp3,
+    forecast5,
+    forecast10,
+    reasons,
+    risks: [],
+    tradeQuality: signal === "WAIT" ? "SKIP" : confidence >= 80 ? "A" : confidence >= 70 ? "B" : "C",
+    rrRatio: levels.rr || 0,
+    marketBias: direction > 0 ? "Bullish" : direction < 0 ? "Bearish" : "Neutral",
+    newsRisk: "Low",
+    path
+  };
+}
+
+function buildStrategyBrief(price, prev, ind, analysis, levels, marketState, history, accountPlan) {
+  const delta = price - prev;
+  const support2 = history.length ? Math.min(...history.slice(-50).map(c => c.low)) : levels.support;
+  const resistance2 = history.length ? Math.max(...history.slice(-50).map(c => c.high)) : levels.resistance;
+  const recommendation = analysis.signal === "WAIT"
+    ? "WAIT until price either reclaims trend alignment or tags a stronger support/resistance edge."
+    : analysis.signal + " with disciplined risk, because indicator pressure and trend structure are aligned.";
+  const warnings = [];
+  if (marketState.volatility === "High") warnings.push("Volatility is high, so size down or widen stops.");
+  if (analysis.signal === "WAIT") warnings.push("Current setup lacks enough confluence for a clean directional trade.");
+  if (ind && Math.abs(ind.ema21 - ind.ema50) < levels.atr * 0.25) warnings.push("EMA spread is tight, which often means chop.");
+  return [
+    "MARKET CONTEXT",
+    "Gold is trading at $" + price.toFixed(2) + " on the " + marketState.tf + " view with a " + marketState.trend.toLowerCase() + " structure.",
+    "Intraperiod momentum is " + (delta >= 0 ? "positive" : "negative") + " at " + Math.abs(delta).toFixed(2) + " points from the last tick, while volatility is " + marketState.volatility.toLowerCase() + ".",
+    "",
+    "TRADE RECOMMENDATION",
+    recommendation,
+    "",
+    "TRADE PLAN",
+    "Entry: $" + price.toFixed(2),
+    "Stop Loss: $" + levels.stop.toFixed(2),
+    "TP1: $" + levels.tp1.toFixed(2),
+    "TP2: $" + levels.tp2.toFixed(2),
+    "Risk/Reward: 1:" + levels.rr.toFixed(2),
+    "Suggested Lot (1% risk): " + accountPlan.finalSuggestedLot,
+    "Est. Risk $: $" + accountPlan.riskDollar.toFixed(2) + " (" + accountPlan.riskPct.toFixed(2) + "% of balance)",
+    "Est. TP1 Profit: $" + accountPlan.tp1Dollar.toFixed(2),
+    "Est. TP2 Profit: $" + accountPlan.tp2Dollar.toFixed(2),
+    "Margin Required: $" + accountPlan.marginRequired.toFixed(2),
+    "",
+    "KEY LEVELS",
+    "Near Support: $" + levels.support.toFixed(2),
+    "Major Support: $" + support2.toFixed(2),
+    "Near Resistance: $" + levels.resistance.toFixed(2),
+    "Major Resistance: $" + resistance2.toFixed(2),
+    "",
+    "CONFLUENCE",
+    analysis.reasons.map(r => "- " + r.text).join("\n") || "- No strong confluence yet",
+    "",
+    "RISKS",
+    (warnings.length ? warnings : ["Respect event risk and do not chase extended candles."]).map(w => "- " + w).join("\n"),
+    "",
+    "CONFIDENCE",
+    analysis.confidence + "% based on trend alignment, momentum, and indicator agreement."
+  ].join("\n");
+}
+
+function Candles({ data, width = 560, height = 130, levels, tf, forecastPath }) {
+  const pad = { top: 8, right: 58, bottom: 22, left: 10 };
+  const futurePoints = forecastPath?.length || 0;
+  const forecastZone = futurePoints ? 90 : 0;
+  const plotWidth = width - pad.left - pad.right - forecastZone;
+  const plotHeight = height - pad.top - pad.bottom;
+  const lo = Math.min(...data.map(c => c.low), ...(forecastPath || []).map(p => p.price), levels?.support ?? Infinity, levels?.stop ?? Infinity, levels?.tp1 ?? Infinity);
+  const hi = Math.max(...data.map(c => c.high), ...(forecastPath || []).map(p => p.price), levels?.resistance ?? -Infinity, levels?.tp1 ?? -Infinity, levels?.tp2 ?? -Infinity);
+  const range = hi - lo || 1;
+  const toY = v => pad.top + plotHeight * (1 - (v - lo) / range);
+  const totalSlots = data.length;
+  const candleSlotWidth = plotWidth / totalSlots;
+  const cw = Math.max(2, Math.floor(candleSlotWidth * 0.75));
+  const candleGap = Math.max(1, candleSlotWidth - cw);
+  const lines = [];
+  if (levels) {
+    [["Support", levels.support, "#34d39922"], ["Resistance", levels.resistance, "#f8717122"], ["Stop", levels.stop, "#f8717140"], ["TP1", levels.tp1, "#34d39940"]].forEach(([label, val, color]) => {
+      lines.push(h("line", { key: label, x1: pad.left, y1: toY(val), x2: width - pad.right - forecastZone, y2: toY(val), stroke: color, strokeWidth: 1, strokeDasharray: "4,4" }));
+    });
+  }
+  const mainStep = Math.max(1, Math.floor((data.length - 1) / 4));
+  return h("svg", { viewBox: "0 0 " + width + " " + height, style: { width: "100%", display: "block" }, preserveAspectRatio: "none" },
+    [0, 0.25, 0.5, 0.75, 1].map((f, i) => {
+      const y = pad.top + plotHeight * f;
+      const value = hi - range * f;
+      return h("g", { key: "grid-" + i },
+        h("line", { x1: pad.left, y1: y, x2: width - pad.right, y2: y, stroke: "#1e293b", strokeWidth: 0.5, strokeDasharray: "3,4" }),
+        h("text", { x: width - 4, y: y + 3, fill: "#64748b", fontSize: 9, textAnchor: "end" }, formatPrice(value))
+      );
+    }),
+    Array.from({ length: 5 }, (_, i) => {
+      const index = Math.min(data.length - 1, i * mainStep);
+      const x = pad.left + index * candleSlotWidth + candleSlotWidth / 2;
+      return h("g", { key: "x-" + i },
+        h("line", { x1: x, y1: pad.top, x2: x, y2: height - pad.bottom, stroke: "#10192b", strokeWidth: 0.4, strokeDasharray: "2,5" }),
+        h("text", { x, y: height - 5, fill: "#64748b", fontSize: 9, textAnchor: "middle" }, formatAxisTime(data[index].time, tf))
+      );
+    }),
+    futurePoints > 0 && forecastPath.map((point, i) => {
+      const x = pad.left + plotWidth + ((i + 1) * forecastZone) / futurePoints;
+      return h("g", { key: "fx-" + i },
+        h("line", { x1: x, y1: pad.top, x2: x, y2: height - pad.bottom, stroke: "#142235", strokeWidth: 0.5, strokeDasharray: "2,4" }),
+        h("text", { x, y: height - 5, fill: "#60a5fa", fontSize: 9, textAnchor: "middle" }, formatAxisTime(point.time, tf))
+      );
+    }),
+    lines,
+    data.map((c, i) => {
+      const bull = c.close >= c.open;
+      const x = pad.left + i * candleSlotWidth + candleSlotWidth / 2 - cw / 2;
+      const bodyTop = toY(Math.max(c.open, c.close));
+      const bodyBottom = toY(Math.min(c.open, c.close));
+      const color = bull ? "#34d399" : "#f87171";
+      return h("g", { key: i },
+        h("line", { x1: x + cw / 2, y1: toY(c.high), x2: x + cw / 2, y2: toY(c.low), stroke: color, strokeWidth: 0.8 }),
+        h("rect", { x, y: bodyTop, width: cw, height: Math.max(bodyBottom - bodyTop, 1), fill: color, rx: 0.5, opacity: i === data.length - 1 ? 1 : 0.96 }),
+        i === data.length - 1 && h("rect", { x: x - 1, y: bodyTop - 1, width: cw + 2, height: Math.max(bodyBottom - bodyTop, 1) + 2, fill: "none", stroke: color, strokeWidth: 1.2, opacity: 0.75 })
+      );
+    }),
+    futurePoints > 0 && h("path", {
+      d: ([["M", pad.left + (data.length - 1) * candleSlotWidth + candleSlotWidth / 2, toY(data[data.length - 1].close)]]
+        .concat(forecastPath.map((point, i) => ["L", pad.left + plotWidth + ((i + 1) * forecastZone) / futurePoints, toY(point.price)]))
+        .map(segment => segment[0] + segment[1] + " " + segment[2]).join(" ")),
+      fill: "none",
+      stroke: forecastPath[forecastPath.length - 1].price >= data[data.length - 1].close ? "#60a5fa" : "#f59e0b",
+      strokeWidth: 2,
+      strokeDasharray: "5,4",
+      strokeLinecap: "round",
+      strokeLinejoin: "round"
+    }),
+    futurePoints > 0 && forecastPath.map((point, i) => {
+      const x = pad.left + plotWidth + ((i + 1) * forecastZone) / futurePoints;
+      const y = toY(point.price);
+      const color = forecastPath[forecastPath.length - 1].price >= data[data.length - 1].close ? "#60a5fa" : "#f59e0b";
+      return h("circle", { key: "fp-" + i, cx: x, cy: y, r: 2.3, fill: color });
+    })
+  );
+}
+
+function MACDChart({ series, width = 560, height = 150, tf }) {
+  if (!series || !series.length) return null;
+  const pad = { top: 10, right: 58, bottom: 22, left: 10 };
+  const plotWidth = width - pad.left - pad.right;
+  const plotHeight = height - pad.top - pad.bottom;
+  const values = series.flatMap(point => [point.macd, point.signal, point.histogram, 0]);
+  const min = Math.min(...values);
+  const max = Math.max(...values);
+  const range = max - min || 1;
+  const zeroY = pad.top + plotHeight * (1 - (0 - min) / range);
+  const toY = value => pad.top + plotHeight * (1 - (value - min) / range);
+  const slotWidth = plotWidth / series.length;
+  const step = slotWidth;
+  const barWidth = Math.max(2, slotWidth * 0.6);
+  const xStep = Math.max(1, Math.floor((series.length - 1) / 4));
+  const buildPath = key => series.map((point, index) => (index === 0 ? "M" : "L") + (padX + index * slotWidth + slotWidth / 2) + " " + toY(point[key])).join(" ");
+  const padX = pad.left;
+  return h("svg", { viewBox: "0 0 " + width + " " + height, style: { width: "100%", display: "block" }, preserveAspectRatio: "none" },
+    [0, 0.25, 0.5, 0.75, 1].map((f, i) => {
+      const y = pad.top + plotHeight * f;
+      const value = max - range * f;
+      return h("g", { key: "grid-" + i },
+        h("line", { x1: pad.left, y1: y, x2: width - pad.right, y2: y, stroke: "#121a2d", strokeWidth: 0.5, strokeDasharray: "3,5" }),
+        h("text", { x: width - 4, y: y + 3, fill: "#64748b", fontSize: 9, textAnchor: "end" }, value.toFixed(3))
+      );
+    }),
+    Array.from({ length: 5 }, (_, i) => {
+      const index = Math.min(series.length - 1, i * xStep);
+      const x = pad.left + index * slotWidth + slotWidth / 2;
+      return h("g", { key: "x-" + i },
+        h("line", { x1: x, y1: pad.top, x2: x, y2: height - pad.bottom, stroke: "#10192b", strokeWidth: 0.4, strokeDasharray: "2,5" }),
+        h("text", { x, y: height - 5, fill: "#64748b", fontSize: 9, textAnchor: "middle" }, formatAxisTime(series[index].time, tf))
+      );
+    }),
+    h("line", { x1: pad.left, y1: zeroY, x2: width - pad.right, y2: zeroY, stroke: "#344054", strokeWidth: 0.8 }),
+    series.map((point, index) => {
+      const x = padX + index * slotWidth + slotWidth / 2;
+      const y = toY(point.histogram);
+      const top = Math.min(y, zeroY);
+      const barHeight = Math.max(Math.abs(zeroY - y), 1);
+      const color = point.histogram >= 0 ? "#d0d5dd99" : "#6b728099";
+      return h("rect", { key: "bar-" + index, x: x - barWidth / 2, y: top, width: barWidth, height: barHeight, fill: color, rx: 0.6, opacity: index === series.length - 1 ? 1 : 0.9 });
+    }),
+    h("path", { d: buildPath("macd"), fill: "none", stroke: "#d1d5db", strokeWidth: 1.35, strokeLinecap: "round", strokeLinejoin: "round" }),
+    h("path", { d: buildPath("signal"), fill: "none", stroke: "#7f1d1d", strokeWidth: 1.6, strokeLinecap: "round", strokeLinejoin: "round", strokeDasharray: "1.5,3" }),
+    h("text", { x: 8, y: 13, fill: "#94a3b8", fontSize: 10 }, "MACD (12, 26, 9)"),
+    h("text", { x: width - 6, y: 13, fill: "#cbd5e1", fontSize: 10, textAnchor: "end" }, series[series.length - 1].macd.toFixed(3) + " " + series[series.length - 1].signal.toFixed(3)),
+    h("text", { x: width - 6, y: zeroY - 4, fill: "#475569", fontSize: 9, textAnchor: "end" }, "0.000")
+  );
+}
+
+function ChartCaption({ text, width = 560, height = 36, tone = "#f59e0b" }) {
+  return h("div", {
+    style: {
+      position: "absolute",
+      left: 16,
+      right: 16,
+      top: 44,
+      height,
+      display: "flex",
+      alignItems: "center",
+      justifyContent: "center",
+      background: "#0a1220dd",
+      border: "1px solid " + tone + "55",
+      color: tone,
+      borderRadius: 8,
+      fontSize: 11,
+      fontWeight: 700,
+      letterSpacing: 0.6,
+      pointerEvents: "none",
+      backdropFilter: "blur(2px)"
+    }
+  }, text);
+}
+
+function Bar({ label, val, min = 0, max = 100, color = "#60a5fa", fmt }) {
+  const pct = Math.min(100, Math.max(0, ((val - min) / (max - min || 1)) * 100));
+  return h("div", { style: { marginBottom: 9 } },
+    h("div", { style: { display: "flex", justifyContent: "space-between", fontSize: 10, color: "#94a3b8", marginBottom: 2 } },
+      h("span", null, label),
+      h("span", { style: { color: "#e2e8f0", fontWeight: 700 } }, fmt ? fmt(val) : val.toFixed(1))
+    ),
+    h("div", { style: { height: 4, background: "#1a2540", borderRadius: 2, overflow: "hidden" } },
+      h("div", { style: { width: pct + "%", height: "100%", background: color, borderRadius: 2, transition: "width 0.6s ease" } })
+    )
+  );
+}
+
+function App() {
+  const persisted = safeReadStorage();
+  const INIT = 4767.89;
+  const [price, setPrice] = useState(INIT);
+  const [prev, setPrev] = useState(INIT);
+  const [history, setHistory] = useState([]);
+  const [historyLoaded, setHistoryLoaded] = useState(false);
+  const [historyTf, setHistoryTf] = useState(persisted.tf || "M5");
+  const [fetching, setFetching] = useState(false);
+  const [apiOk, setApiOk] = useState(null);
+  const [sourceLabel, setSourceLabel] = useState("Starting");
+  const [updated, setUpdated] = useState(new Date());
+  const [clockNow, setClockNow] = useState(Date.now());
+  const [tab, setTab] = useState("dashboard");
+  const [tf, setTf] = useState(persisted.tf || "M5");
+  const [zoomBars, setZoomBars] = useState(persisted.zoomBars || 50);
+  const [accountBalance, setAccountBalance] = useState(persisted.accountBalance || "");
+  const [tradeRate, setTradeRate] = useState(persisted.tradeRate || "0.10");
+  const [leverage, setLeverage] = useState(persisted.leverage || "100");
+  const [feedProvider, setFeedProvider] = useState(persisted.feedProvider || "public");
+  const [apiKey, setApiKey] = useState(persisted.apiKey || "");
+  const [forecastBrain, setForecastBrain] = useState(persisted.forecastBrain || "local");
+  const [forecastApiKey, setForecastApiKey] = useState(persisted.forecastApiKey || "");
+  const [forecastModel, setForecastModel] = useState(persisted.forecastModel || "gpt-4.1-mini");
+  const [pollMs, setPollMs] = useState(persisted.pollMs || 1000);
+  const [alarms, setAlarms] = useState(Array.isArray(persisted.alarms) ? persisted.alarms : []);
+  const [notifs, setNotifs] = useState([]);
+  const [aType, setAType] = useState("price");
+  const [aVal, setAVal] = useState("");
+  const [aDir, setADir] = useState("above");
+  const [aSig, setASig] = useState("BUY");
+  const [aDur, setADur] = useState(2);
+  const [brief, setBrief] = useState(persisted.brief || null);
+  const [prediction, setPrediction] = useState(null);
+  const [predictionLoading, setPredictionLoading] = useState(false);
+  const [feedError, setFeedError] = useState("");
+  const [forecastError, setForecastError] = useState("");
+  const [newsEvents, setNewsEvents] = useState([]);
+  const [newsFetched, setNewsFetched] = useState(false);
+  const [newsBlock, setNewsBlock] = useState(false);
+  const alarmIdRef = useRef(persisted.lastAlarmId || 0);
+  const prevSigRef = useRef("WAIT");
+  const priceRef = useRef(INIT);
+
+  useEffect(() => {
+    const iv = setInterval(() => setClockNow(Date.now()), 30000);
+    return () => clearInterval(iv);
+  }, []);
+
+  const addNotif = useCallback((msg, type = "info") => {
+    const id = Date.now() + Math.random();
+    setNotifs(prevList => [{ id, msg, type }, ...prevList.slice(0, 7)]);
+    setTimeout(() => setNotifs(prevList => prevList.filter(n => n.id !== id)), 7000);
+  }, []);
+
+  const session = getMarketSessionStatus(new Date(clockNow));
+
+  const fetchNews = useCallback(async () => {
+    try {
+      const resp = await fetch("http://127.0.0.1:8787/news");
+      if (!resp.ok) return;
+      const data = await resp.json();
+      const events = data.news || [];
+      setNewsEvents(events);
+      setNewsFetched(true);
+      const now = Date.now();
+      const imminent = events.some(e => {
+        const eventTime = new Date(e.time).getTime();
+        return Math.abs(eventTime - now) < 30 * 60 * 1000;
+      });
+      if (imminent) {
+        setNewsBlock(true);
+        addNotif("High-impact USD news event within 30 minutes - trades blocked", "warning");
+        beep(440, 2, "sine");
+      } else {
+        setNewsBlock(false);
+      }
+    } catch (err) {
+      setNewsFetched(false);
+    }
+  }, [addNotif]);
+
+  useEffect(() => {
+    fetchNews();
+    const iv = setInterval(fetchNews, 15 * 60 * 1000);
+    return () => clearInterval(iv);
+  }, [fetchNews]);
+
+  const loadHistory = useCallback(async () => {
+    setHistoryLoaded(false);
+    setFeedError("");
+    try {
+      let candles = [];
+      if (feedProvider === "twelvedata" && apiKey.trim()) {
+        candles = await fetchTwelveDataHistory(apiKey.trim(), tf);
+      } else {
+        candles = await fetchPublicHistory(tf);
+      }
+      if (candles.length < 30) {
+        throw new Error("Not enough candles returned (" + candles.length + ")");
+      }
+      candles.sort((a, b) => a.time - b.time);
+      setHistory(candles);
+      setHistoryTf(tf);
+      setHistoryLoaded(true);
+      const lastClose = candles[candles.length - 1].close;
+      setPrice(lastClose);
+      setPrev(lastClose);
+      priceRef.current = lastClose;
+      setUpdated(new Date());
+      setSourceLabel((feedProvider === "twelvedata" && apiKey.trim() ? "Twelve Data" : "Yahoo Finance") + " history loaded | last candle " + formatAxisTime(candles[candles.length - 1].time, tf));
+    } catch (err) {
+      console.warn("History load failed, falling back to simulation:", err.message);
+      const fallback = genHistory(priceRef.current || price || INIT, 300);
+      setHistory(fallback);
+      setHistoryTf("M1");
+      setHistoryLoaded(true);
+      setFeedError("Live history unavailable - showing simulation. Error: " + err.message);
+      setSourceLabel("simulation history fallback");
+    }
+  }, [feedProvider, apiKey, tf, price]);
+
+  useEffect(() => {
+    loadHistory();
+  }, [loadHistory]);
+
+  const fetchPrice = useCallback(async () => {
+    if (session.isClosed) {
+      setFetching(false);
+      setApiOk(true);
+      setSourceLabel("Market closed - feed paused");
+      return;
+    }
+    setFetching(true);
+    let newPrice = null;
+    let source = "";
+    setFeedError("");
+
+    if (feedProvider === "twelvedata" && apiKey.trim()) {
+      try {
+        const live = await fetchTwelveDataPrice(apiKey.trim());
+        newPrice = live.price;
+        source = live.source;
+        setApiOk(true);
+      } catch (err) {
+        setFeedError(err.message || "Provider request failed");
+      }
+    }
+
+    if (!newPrice) {
+      try {
+        const response = await fetch("https://api.gold-api.com/price/XAU", { cache: "no-store" });
+        if (response.ok) {
+          const data = await response.json();
+          const parsed = parseFloat(data.price || data.ask || data.bid || 0);
+          if (parsed > 1000) {
+            newPrice = parsed;
+            source = "gold-api.com";
+            setApiOk(true);
+          }
+        }
+      } catch (err) {}
+    }
+
+    if (!newPrice) {
+      try {
+        const response = await fetch("https://api.metals.live/v1/spot/gold", { cache: "no-store" });
+        if (response.ok) {
+          const data = await response.json();
+          const parsed = parseFloat(data[0]?.price || 0);
+          if (parsed > 1000) {
+            newPrice = parsed;
+            source = "metals.live";
+            setApiOk(true);
+          }
+        }
+      } catch (err) {}
+    }
+
+    if (newPrice && newPrice > 1000) {
+      const current = priceRef.current;
+      const candleMs = (TF_CONFIG[historyTf]?.minutes || 1) * 60000;
+      const candleStart = Math.floor(Date.now() / candleMs) * candleMs;
+      setPrev(current);
+      setPrice(newPrice);
+      priceRef.current = newPrice;
+      setHistory(prevHistory => {
+        if (!prevHistory.length) return prevHistory;
+        let next = [...prevHistory];
+        const last = next[next.length - 1];
+        if (last.time >= candleStart) {
+          next[next.length - 1] = {
+            ...last,
+            high: Math.max(last.high, newPrice),
+            low: Math.min(last.low, newPrice),
+            close: newPrice
+          };
+        } else {
+          next.push({
+            time: candleStart,
+            open: last.close,
+            high: Math.max(last.close, newPrice),
+            low: Math.min(last.close, newPrice),
+            close: newPrice
+          });
+          if (next.length > HISTORY_LIMIT) next = next.slice(-HISTORY_LIMIT);
+        }
+        return next;
+      });
+      setUpdated(new Date());
+      setSourceLabel(source + (feedProvider === "twelvedata" && apiKey.trim() ? " 1s live" : " live") + " | last candle " + formatAxisTime(candleStart, tf));
+    } else {
+      setApiOk(false);
+      setUpdated(new Date());
+      setSourceLabel(feedProvider === "twelvedata" && apiKey.trim() ? "provider unavailable - last price held" : "public feed unavailable - last price held");
+    }
+
+    setFetching(false);
+  }, [apiKey, feedProvider, historyTf, session.isClosed]);
+
+  useEffect(() => {
+    if (session.isClosed) {
+      setSourceLabel("Market closed - feed paused");
+      return;
+    }
+    fetchPrice();
+      const refreshRate = feedProvider === "twelvedata" && apiKey.trim() ? Math.max(1000, pollMs) : 15000;
+    const iv = setInterval(fetchPrice, refreshRate);
+    return () => clearInterval(iv);
+  }, [fetchPrice, feedProvider, apiKey, pollMs, session.isClosed]);
+
+  useEffect(() => {
+    try {
+      localStorage.setItem(STORAGE_KEY, JSON.stringify({
+        tf,
+        zoomBars,
+        accountBalance,
+        tradeRate,
+        leverage,
+        feedProvider,
+        apiKey,
+        forecastBrain,
+        forecastApiKey,
+        forecastModel,
+        pollMs,
+        alarms,
+        lastAlarmId: alarmIdRef.current,
+        brief
+      }));
+    } catch (err) {}
+  }, [tf, zoomBars, accountBalance, tradeRate, leverage, feedProvider, apiKey, forecastBrain, forecastApiKey, forecastModel, pollMs, alarms, brief]);
+
+  const viewHistory = historyTf === "M1" ? aggregateHistory(history, tf) : history.slice();
+  const visibleHistory = viewHistory.slice(-zoomBars);
+  const viewPrice = visibleHistory[visibleHistory.length - 1]?.close ?? price;
+  const latestBaseCandleTime = history[history.length - 1]?.time || 0;
+  const latestViewCandleTime = visibleHistory[visibleHistory.length - 1]?.time || 0;
+  const staleThresholdMs = getStaleThresholdMs(tf);
+  const dataAgeMs = latestViewCandleTime ? Date.now() - latestViewCandleTime : Infinity;
+  const dataIsStale = !session.isClosed && dataAgeMs > staleThresholdMs;
+  const ind = getIndicators(viewHistory, viewPrice);
+  const baseAnalysis = getSignal(ind, viewPrice);
+  const levels = getLevels(visibleHistory, viewPrice, ind, baseAnalysis);
+  const accountPlan = calcAccountPlan(viewPrice, levels, accountBalance, tradeRate, leverage);
+  const gatedSignal = applyRiskGateToSignal(levels.signal, accountPlan);
+  const finalGatedSignal = newsBlock ? "WAIT" : gatedSignal;
+  const mtfConfluence = React.useMemo(() => {
+    if (history.length < 100) return null;
+    return getMultiTimeframeConfluence(historyTf === "M1" ? history : aggregateHistory(history, "M1"), viewPrice);
+  }, [history, historyTf, viewPrice]);
+  const mtfAligned = mtfConfluence?.aligned ?? false;
+  const analysis = {
+    ...baseAnalysis,
+    signal: (finalGatedSignal !== "WAIT" && accountPlan.tradable && !newsBlock && levels.confidence >= 78 && (mtfAligned || levels.confidence >= 85))
+      ? finalGatedSignal
+      : "WAIT",
+    confidence: finalGatedSignal !== "WAIT" && accountPlan.tradable ? levels.confidence : Math.min(levels.confidence, 42),
+    reasons: [
+      ...baseAnalysis.reasons,
+      ...(mtfConfluence ? [{ dir: mtfConfluence.aligned ? "buy" : "neutral", text: "MTF confluence: " + mtfConfluence.confluence.replace("_", " ") }] : []),
+      ...(newsBlock ? [{ dir: "neutral", text: "High-impact USD news block active - trading paused." }] : []),
+      ...levels.planReasons.map(text => ({ dir: "neutral", text })),
+      ...accountPlan.warnings.map(text => ({ dir: "neutral", text }))
+    ]
+  };
+  const displayAnalysis = session.isClosed ? { ...analysis, signal: "WAIT", confidence: 0 } : analysis;
+  const marketState = getMarketState(viewHistory, viewPrice, ind, analysis, tf);
+  const predictionColor = !prediction ? "#60a5fa" : prediction.signal === "BUY" ? "#34d399" : prediction.signal === "SELL" ? "#f59e0b" : "#94a3b8";
+
+  useEffect(() => {
+    if (!historyLoaded || session.isClosed) return;
+    if (!dataIsStale) return;
+    setSourceLabel("DATA STALE - reloading history");
+    loadHistory();
+  }, [dataIsStale, historyLoaded, session.isClosed, loadHistory]);
+
+  useEffect(() => {
+    setPrediction(null);
+    setForecastError("");
+  }, [tf, session.isClosed, forecastBrain]);
+
+  const runPrediction = useCallback(async () => {
+    setForecastError("");
+    if (forecastBrain === "local" || !forecastApiKey.trim()) {
+      setPrediction(buildPrediction(visibleHistory, ind, levels, marketState, tf, session));
+      return;
+    }
+    setPredictionLoading(true);
+    try {
+      const localPrediction = buildPrediction(visibleHistory, ind, levels, marketState, tf, session);
+      const mtf = getMultiTimeframeConfluence(historyTf === "M1" ? history : aggregateHistory(history, "M1"), viewPrice);
+      const patterns = ind?.patterns || [];
+      const fib = ind?.fib || null;
+      const pivots = ind?.pivots || null;
+      const systemPrompt = "You are the world's most accurate XAUUSD short-term trading analyst.\n"
+        + "You combine institutional-grade technical analysis with macro awareness.\n"
+        + "Your primary mission: PROTECT THE USER'S CAPITAL.\n"
+        + "You only recommend a trade when you are genuinely confident (>=80%).\n"
+        + "If ANY of these conditions exist, you MUST return WAIT:\n"
+        + "- Multi-timeframe signals disagree\n"
+        + "- ADX < 18 (no trend)\n"
+        + "- High-impact news within 30 minutes\n"
+        + "- Risk:Reward < 1.5\n"
+        + "- Price is between EMA21 and EMA50 (no clear trend stack)\n"
+        + "- RSI is between 45-55 (no momentum)\n"
+        + "When you do signal BUY or SELL, provide exact price levels derived from chart structure, not arbitrary offsets.";
+      const prompt = `Analyze this XAUUSD market snapshot and return ONLY valid JSON.
+
+REQUIRED JSON FORMAT:
+{
+  "signal": "BUY" | "SELL" | "WAIT",
+  "confidence": 0-100,
+  "entry": price,
+  "stop": price,
+  "tp1": price,
+  "tp2": price,
+  "tp3": price,
+  "forecast5": price_in_5_minutes,
+  "forecast10": price_in_10_minutes,
+  "horizon": "5m" | "15m" | "30m",
+  "rr_ratio": number,
+  "trade_quality": "A" | "B" | "C" | "SKIP",
+  "reasons": ["reason1", "reason2", "reason3", "reason4", "reason5"],
+  "risks": ["risk1", "risk2"],
+  "market_bias": "Bullish" | "Bearish" | "Neutral",
+  "news_risk": "High" | "Medium" | "Low"
+}
+
+MARKET DATA:
+- Current Price: $${viewPrice.toFixed(2)}
+- Timeframe: ${tf}
+- Session: ${session.isClosed ? "CLOSED" : "OPEN"}
+- Market Trend: ${marketState.trend} | Volatility: ${marketState.volatility}
+
+INDICATORS:
+- RSI(14): ${ind?.rsi?.toFixed(1) || "N/A"} ${ind?.rsi > 70 ? "(OVERBOUGHT)" : ind?.rsi < 30 ? "(OVERSOLD)" : ""}
+- MACD: ${ind?.macd?.macd?.toFixed(3)} | Signal: ${ind?.macd?.signal?.toFixed(3)} | Hist: ${ind?.macd?.histogram?.toFixed(3)}
+- Stochastic: ${ind?.stoch?.toFixed(1) || "N/A"} ${ind?.stoch > 85 ? "(OVERBOUGHT)" : ind?.stoch < 15 ? "(OVERSOLD)" : ""}
+- EMA21: $${ind?.ema21?.toFixed(2)} | EMA50: $${ind?.ema50?.toFixed(2)} | EMA200: $${ind?.ema200?.toFixed(2) || "N/A"}
+- ADX: ${ind?.dmi?.adx?.toFixed(1)} | +DI: ${ind?.dmi?.plusDI?.toFixed(1)} | -DI: ${ind?.dmi?.minusDI?.toFixed(1)}
+- ATR: $${ind?.atr?.toFixed(2)} (${ind?.atr ? ((ind.atr / viewPrice) * 100).toFixed(3) : "0.000"}%)
+- BB Upper: $${ind?.bb?.upper?.toFixed(2)} | Middle: $${ind?.bb?.middle?.toFixed(2)} | Lower: $${ind?.bb?.lower?.toFixed(2)}
+- VWAP: $${ind?.vwap?.toFixed(2) || "N/A"} | Price vs VWAP: ${ind?.vwap ? (viewPrice > ind.vwap ? "ABOVE" : "BELOW") : "N/A"}
+- OBV Trend: ${ind?.obv?.trend || "N/A"}
+- Ichimoku: ${ind?.ichimoku ? (ind.ichimoku.aboveCloud ? "ABOVE CLOUD" : ind.ichimoku.belowCloud ? "BELOW CLOUD" : "IN CLOUD") : "N/A"}
+
+MULTI-TIMEFRAME CONFLUENCE:
+- M5: ${mtf.M5} | M15: ${mtf.M15} | H1: ${mtf.H1}
+- Overall Confluence: ${mtf.confluence} (${mtf.confluenceScore}%)
+- Alignment: ${mtf.aligned ? "YES - proceed with confidence" : "NO - signals disagree, prefer WAIT"}
+
+KEY LEVELS:
+- Near Support: $${levels.support?.toFixed(2)} | Near Resistance: $${levels.resistance?.toFixed(2)}
+- Stop Zone: $${levels.stop?.toFixed(2)} | TP1: $${levels.tp1?.toFixed(2)} | TP2: $${levels.tp2?.toFixed(2)}
+- Pivot P: $${pivots?.P?.toFixed(2) || "N/A"} | R1: $${pivots?.R1?.toFixed(2) || "N/A"} | S1: $${pivots?.S1?.toFixed(2) || "N/A"}
+- Fib 61.8%: $${fib?.fib618?.toFixed(2) || "N/A"} | 50%: $${fib?.fib500?.toFixed(2) || "N/A"} | 38.2%: $${fib?.fib382?.toFixed(2) || "N/A"}
+
+CANDLE PATTERNS: ${patterns.length ? patterns.map(p => p.name + "(" + p.dir + ")").join(", ") : "None detected"}
+
+NEWS EVENTS (last 12h / next 2h): ${newsEvents.length ? newsEvents.map(e => e.title + " [" + e.impact + "]").join("; ") : "No high-impact events"}
+NEWS BLOCK ACTIVE: ${newsBlock ? "YES - recommend WAIT" : "NO"}
+
+ACCOUNT:
+- Balance: $${Number(accountBalance) > 0 ? Number(accountBalance).toFixed(2) : "Not set"}
+- Lot Size: ${tradeRate}
+- Leverage: ${leverage}x
+- Suggested Lot (1% risk): ${accountPlan.finalSuggestedLot}
+- Risk at current SL: $${accountPlan.riskDollar.toFixed(2)} (${accountPlan.riskPct.toFixed(2)}% of balance)
+
+LAST 5 CANDLES (newest last):
+${visibleHistory.slice(-5).map(c =>
+  "O:" + c.open.toFixed(2) + " H:" + c.high.toFixed(2) + " L:" + c.low.toFixed(2) + " C:" + c.close.toFixed(2) + " [" + (c.close >= c.open ? "UP" : "DOWN") + "]"
+).join("\n")}
+
+THINK STEP BY STEP:
+1. Is the trend clear and strong? (EMA stack + ADX)
+2. Do all 3 timeframes agree?
+3. Is momentum supporting entry? (MACD + RSI zone)
+4. Is price at a structural location? (S/R / Fib / Pivot)
+5. Is risk:reward >= 1.8?
+6. Are there any news risks?
+7. Only output BUY or SELL if ALL criteria pass. Otherwise WAIT.`;
+      const raw = forecastBrain === "openai"
+        ? await requestOpenAIForecast(forecastApiKey.trim(), forecastModel || "gpt-4.1-mini", prompt, systemPrompt)
+        : await requestGeminiForecast(forecastApiKey.trim(), forecastModel || "gemini-2.5-flash", prompt, systemPrompt);
+      const json = extractJsonBlock(raw);
+      if (!json) throw new Error("AI response did not return valid JSON");
+      const parsed = JSON.parse(json);
+      const normalized = normalizePredictionPayload(parsed, viewPrice, session);
+      if (!normalized) throw new Error("AI prediction payload invalid");
+      setPrediction(normalized);
+    } catch (err) {
+      setForecastError(err.message || "Forecast request failed");
+      setPrediction(buildPrediction(visibleHistory, ind, levels, marketState, tf, session));
+    } finally {
+      setPredictionLoading(false);
+    }
+  }, [forecastBrain, forecastApiKey, forecastModel, visibleHistory, ind, levels, marketState, tf, session, viewPrice, accountBalance, tradeRate, leverage, accountPlan, history, historyTf, newsEvents, newsBlock]);
+
+  useEffect(() => {
+    const sig = analysis.signal;
+    const conf = analysis.confidence;
+    if (!session.isClosed && sig !== "WAIT" && sig !== prevSigRef.current) {
+      if (conf >= 78) {
+        beep(sig === "BUY" ? 880 : 400, 0.4, "square");
+        setTimeout(() => beep(sig === "BUY" ? 1046 : 350, 0.4, "square"), 500);
+        setTimeout(() => beep(sig === "BUY" ? 1318 : 300, 0.6, "square"), 1000);
+        addNotif("HIGH CONFIDENCE " + sig + " on " + tf + " - " + conf + "% | Entry $" + viewPrice.toFixed(2), sig === "BUY" ? "success" : "danger");
+      } else if (conf >= 65) {
+        beep(sig === "BUY" ? 660 : 440, 1.0);
+        addNotif((sig === "BUY" ? "Moderate BUY" : "Moderate SELL") + " setup on " + tf + " - " + conf + "%", sig === "BUY" ? "success" : "danger");
+      }
+    }
+    prevSigRef.current = sig;
+  }, [analysis.signal, analysis.confidence, tf, addNotif, session.isClosed, viewPrice]);
+
+  useEffect(() => {
+    if (session.isClosed) return;
+    if (analysis.signal === "WAIT") return;
+    if (forecastBrain === "local") return;
+    if (!forecastApiKey.trim()) return;
+    const iv = setInterval(() => {
+      if (analysis.signal !== "WAIT") runPrediction();
+    }, 5 * 60 * 1000);
+    return () => clearInterval(iv);
+  }, [analysis.signal, forecastBrain, forecastApiKey, session.isClosed, runPrediction]);
+
+  useEffect(() => {
+    if (session.isClosed) return;
+    setAlarms(prevAlarms => prevAlarms.map(a => {
+      if (a.triggered) return a;
+      const hit = a.type === "price" ? (a.dir === "above" ? price >= a.val : price <= a.val) : analysis.signal === a.sig;
+      if (!hit) return a;
+      beep(a.type === "signal" ? (a.sig === "BUY" ? 660 : 400) : (a.dir === "above" ? 660 : 400), a.dur);
+      addNotif((a.type === "price" ? "Price alarm " + a.dir + " $" + a.val.toFixed(2) : "Signal alarm " + a.sig) + " triggered", "warning");
+      return { ...a, triggered: true, triggeredAt: Date.now() };
+    }));
+  }, [price, analysis.signal, addNotif, session.isClosed]);
+
+  const sigCol = displayAnalysis.signal === "BUY" ? "#34d399" : displayAnalysis.signal === "SELL" ? "#f87171" : "#f59e0b";
+  const pCol = price >= prev ? "#34d399" : "#f87171";
+  const delta = (price - prev).toFixed(2);
+  const deltaPct = (((price - prev) / prev) * 100).toFixed(3);
+  const tfs = Object.keys(TF_CONFIG);
+  const liveRiskDollar = accountBalance && tradeRate && levels ? Math.abs(viewPrice - levels.stop) * 100 * Number(tradeRate) : 0;
+  const liveRiskPct = accountBalance && tradeRate && Number(accountBalance) > 0 ? (liveRiskDollar / Number(accountBalance)) * 100 : 0;
+  const liveTp1Dollar = accountBalance && tradeRate && levels ? Math.abs(levels.tp1 - viewPrice) * 100 * Number(tradeRate) : 0;
+  const liveTp2Dollar = accountBalance && tradeRate && levels ? Math.abs(levels.tp2 - viewPrice) * 100 * Number(tradeRate) : 0;
+
+  const S = {
+    wrap: { background: "#060d1a", minHeight: "680px" },
+    hdr: { background: "#09111f", borderBottom: "2px solid #0f2240", padding: "10px 16px", display: "flex", alignItems: "center", justifyContent: "space-between", flexWrap: "wrap", gap: 8 },
+    card: { background: "#0d1629", border: "1px solid #1a2d4a", borderRadius: 10, padding: "12px 14px" },
+    tabRow: { display: "flex", gap: 0, background: "#09111f", borderBottom: "1px solid #1a2d4a", overflowX: "auto" },
+    tab: active => ({ background: "none", border: "none", borderBottom: active ? "2px solid #fbbf24" : "2px solid transparent", color: active ? "#fbbf24" : "#4a6080", padding: "9px 16px", cursor: "pointer", fontSize: 11, fontWeight: 700, letterSpacing: 1, transition: "color 0.2s", whiteSpace: "nowrap" }),
+    btn: c => ({ background: c + "18", border: "1px solid " + c + "55", color: c, borderRadius: 6, padding: "6px 12px", cursor: "pointer", fontSize: 11, fontWeight: 700, letterSpacing: 0.5 }),
+    inp: { background: "#111e35", border: "1px solid #1a3050", color: "#e2e8f0", borderRadius: 6, padding: "6px 10px", fontSize: 12, width: "100%" },
+    pill: c => ({ background: c + "20", color: c, border: "1px solid " + c + "44", borderRadius: 20, padding: "3px 10px", fontSize: 11, fontWeight: 700, letterSpacing: 0.5, display: "inline-block" }),
+    tpBox: c => ({ background: c + "0e", border: "1px solid " + c + "30", borderRadius: 8, padding: "10px 12px", textAlign: "center", flex: 1, minWidth: 0 }),
+    ntfy: t => ({ background: t === "success" ? "#042010" : t === "danger" ? "#1a0808" : t === "warning" ? "#1a1000" : "#0d1629", border: "1px solid " + (t === "success" ? "#34d39966" : t === "danger" ? "#f8717166" : t === "warning" ? "#f59e0b66" : "#2a3f60"), borderRadius: 8, padding: "9px 14px", fontSize: 11, color: t === "success" ? "#34d399" : t === "danger" ? "#f87171" : t === "warning" ? "#f59e0b" : "#94a3b8", animation: "slideIn 0.3s ease", boxShadow: "0 4px 24px rgba(0,0,0,0.5)" })
+  };
+
+  return h("div", { style: S.wrap },
+    h("div", { style: { position: "fixed", top: 10, right: 10, zIndex: 9999, display: "flex", flexDirection: "column", gap: 6, maxWidth: 310 } },
+      notifs.map(n => h("div", { key: n.id, style: S.ntfy(n.type) }, n.msg))
+    ),
+    h("div", { style: S.hdr },
+      h("div", { style: { display: "flex", alignItems: "center", gap: 16, flexWrap: "wrap" } },
+        h("div", { style: { fontSize: 16, fontWeight: 700, color: "#fbbf24", letterSpacing: 2 } }, "XAUUSD ORACLE"),
+        h("div", null,
+          h("div", { style: { fontSize: 30, fontWeight: 700, color: pCol, fontFamily: "monospace", letterSpacing: 1, lineHeight: 1.1 } }, formatPrice(price) + " USD", h("span", { style: { fontSize: 11, marginLeft: 8, color: fetching ? "#f59e0b" : "#1e3a5f", animation: fetching ? "pulse 0.8s infinite" : "none" } }, "●")),
+          h("div", { style: { fontSize: 11, color: pCol, marginTop: 1 } }, (price >= prev ? "▲" : "▼") + " " + Math.abs(delta) + " (" + Math.abs(deltaPct) + "%)", h("span", { style: { marginLeft: 8, color: "#2a4060", fontSize: 10 } }, updated.toLocaleTimeString()))
+        )
+      ),
+        h("div", { style: { display: "flex", alignItems: "center", gap: 8, flexWrap: "wrap" } },
+          h("div", { style: S.pill(sigCol) }, displayAnalysis.signal + " " + displayAnalysis.confidence + "%"),
+          h("div", { style: S.pill(session.isClosed ? "#f59e0b" : apiOk === false ? "#f59e0b" : "#34d399") }, session.isClosed ? "MARKET CLOSED" : apiOk === false ? "SIM MODE" : "LIVE"),
+          dataIsStale && h("div", { style: S.pill("#f87171") }, "DATA STALE"),
+          h("div", { style: S.pill("#60a5fa") }, tf + " VIEW"),
+          h("div", { style: S.pill("#a78bfa") }, sourceLabel),
+          feedProvider === "twelvedata" && apiKey.trim() && h("div", { style: S.pill("#fbbf24") }, (Math.max(1000, pollMs) / 1000).toFixed(0) + "s refresh"),
+        h("button", { onClick: () => { loadHistory(); fetchPrice(); }, style: S.btn("#60a5fa"), disabled: fetching }, fetching ? "..." : "REFRESH")
+        )
+    ),
+    h("div", { style: S.tabRow },
+      ["dashboard", "signals", "alarms", "analysis", "intel", "data"].map(name => h("button", { key: name, style: S.tab(tab === name), onClick: () => setTab(name) }, name.toUpperCase()))
+    ),
+    h("div", { style: { padding: 14, display: "flex", flexDirection: "column", gap: 12 } },
+      tab === "dashboard" && h("div", { style: { display: "flex", flexDirection: "column", gap: 12 } },
+        h("div", { className: "top-grid", style: { display: "grid", gridTemplateColumns: "1fr 260px", gap: 12 } },
+          h("div", { style: { display: "flex", flexDirection: "column", gap: 10 } },
+            h("div", { style: S.card },
+              h("div", { style: { display: "flex", justifyContent: "space-between", alignItems: "center", marginBottom: 8, gap: 8, flexWrap: "wrap" } },
+                h("div", { style: { display: "flex", alignItems: "center", gap: 8, flexWrap: "wrap" } },
+                  h("span", { style: { fontSize: 10, color: "#4a6080", letterSpacing: 1 } }, "CANDLESTICK - XAU/USD"),
+                  h("span", {
+                    style: {
+                      fontSize: 9,
+                      color: "#34d399",
+                      background: "#042010",
+                      border: "1px solid #34d39933",
+                      borderRadius: 4,
+                      padding: "1px 6px",
+                      fontWeight: 700,
+                      letterSpacing: 0.5
+                    }
+                  }, "SLT (UTC+5:30)")
+                ),
+                h("div", { style: { display: "flex", gap: 3, flexWrap: "wrap", alignItems: "center" } },
+                  tfs.map(code => h("button", { key: code, onClick: () => { setTf(code); setHistoryLoaded(false); }, style: { background: tf === code ? "#0f2240" : "none", border: "1px solid " + (tf === code ? "#60a5fa" : "#1a2d4a"), color: tf === code ? "#60a5fa" : "#2a4060", borderRadius: 4, padding: "2px 6px", cursor: "pointer", fontSize: 10, fontWeight: 700 } }, code)),
+                  h("div", { style: { width: 1, height: 16, background: "#1a2d4a", margin: "0 4px" } }),
+                  [["-","Zoom out",120], ["1x","Default zoom",50], ["+","Zoom in",24]].map(([label, title, value]) => h("button", { key: label, title, onClick: () => setZoomBars(value), style: { background: zoomBars === value ? "#2b1f04" : "none", border: "1px solid " + (zoomBars === value ? "#fbbf24" : "#1a2d4a"), color: zoomBars === value ? "#fbbf24" : "#4a6080", borderRadius: 4, padding: "2px 7px", cursor: "pointer", fontSize: 10, fontWeight: 700 } }, label))
+                )
+              ),
+              h("div", { style: { position: "relative" } },
+                historyLoaded
+                  ? h(Candles, { data: visibleHistory, levels: { ...levels, signal: analysis.signal }, tf, forecastPath: prediction?.path })
+                  : h("div", {
+                      style: {
+                        height: 130,
+                        display: "flex",
+                        alignItems: "center",
+                        justifyContent: "center",
+                        color: "#2a4060",
+                        fontSize: 12,
+                        letterSpacing: 1
+                      }
+                    }, "LOADING LIVE CHART HISTORY..."),
+                historyLoaded && h("div", {
+                  style: {
+                    position: "absolute",
+                    left: 16,
+                    bottom: 8,
+                    background: dataIsStale ? "#2a0d0d" : "#06121e",
+                    border: "1px solid " + (dataIsStale ? "#f8717155" : "#1a2d4a"),
+                    borderRadius: 6,
+                    padding: "4px 8px",
+                    fontSize: 10,
+                    color: dataIsStale ? "#f87171" : "#94a3b8"
+                  }
+                }, "Last candle: " + formatSriLankaDateTime(latestViewCandleTime) + " | Now: " + formatSriLankaDateTime(Date.now())),
+                session.isClosed && h(ChartCaption, { text: session.caption })
+              )
+            ),
+            h("div", { style: S.card },
+              h("div", { style: { display: "flex", justifyContent: "space-between", alignItems: "center", marginBottom: 6 } },
+                h("span", { style: { fontSize: 10, color: "#4a6080", letterSpacing: 1 } }, "MACD INDICATOR"),
+                ind && h("div", { style: { fontSize: 10, color: "#94a3b8", fontFamily: "monospace" } }, "MACD " + ind.macd.macd.toFixed(3) + " | Signal " + ind.macd.signal.toFixed(3) + " | Hist " + ind.macd.histogram.toFixed(3))
+              ),
+              h("div", { style: { position: "relative" } },
+                historyLoaded
+                  ? (ind && h(MACDChart, { series: ind.macd.series.slice(-zoomBars), height: 160, tf }))
+                  : h("div", {
+                      style: {
+                        height: 160,
+                        display: "flex",
+                        alignItems: "center",
+                        justifyContent: "center",
+                        color: "#2a4060",
+                        fontSize: 12,
+                        letterSpacing: 1
+                      }
+                    }, "LOADING LIVE CHART HISTORY..."),
+                session.isClosed && h(ChartCaption, { text: "MACD paused while market is closed", tone: "#94a3b8", height: 32 })
+              )
+            )
+          ),
+          h("div", { style: { display: "flex", flexDirection: "column", gap: 8 } },
+            h("div", { style: { ...S.card, border: "1px solid #fbbf2430" } },
+              h("div", { style: { fontSize: 9, color: "#fbbf24", letterSpacing: 1, marginBottom: 8 } }, "POSITION CALCULATOR"),
+              h("div", { style: { display: "grid", gridTemplateColumns: "1fr 1fr 1fr", gap: 6 } },
+                h("div", null,
+                  h("div", { style: { fontSize: 9, color: "#4a6080", marginBottom: 3 } }, "BALANCE ($)"),
+                  h("input", { style: { ...S.inp, borderColor: accountBalance ? "#34d39966" : "#f8717166", fontSize: 13, fontWeight: 700 }, type: "number", placeholder: "e.g. 1000", value: accountBalance, onChange: e => setAccountBalance(e.target.value) })
+                ),
+                h("div", null,
+                  h("div", { style: { fontSize: 9, color: "#4a6080", marginBottom: 3 } }, "LOT SIZE"),
+                  h("input", { style: { ...S.inp, borderColor: tradeRate ? "#34d39966" : "#f8717166", fontSize: 13, fontWeight: 700 }, type: "number", step: "0.01", placeholder: "0.10", value: tradeRate, onChange: e => setTradeRate(e.target.value) })
+                ),
+                h("div", null,
+                  h("div", { style: { fontSize: 9, color: "#4a6080", marginBottom: 3 } }, "LEVERAGE"),
+                  h("input", { style: S.inp, type: "number", placeholder: "100", value: leverage, onChange: e => setLeverage(e.target.value) })
+                )
+              ),
+              accountBalance && tradeRate && h("div", { style: { marginTop: 8, display: "grid", gridTemplateColumns: "1fr 1fr", gap: 5 } },
+                [
+                  ["Risk $", "$" + liveRiskDollar.toFixed(2), liveRiskPct > 2 ? "#f87171" : liveRiskPct > 1 ? "#f59e0b" : "#34d399"],
+                  ["Risk %", liveRiskPct.toFixed(2) + "%", liveRiskPct > 2 ? "#f87171" : liveRiskPct > 1 ? "#f59e0b" : "#34d399"],
+                  ["TP1 Profit", "+$" + liveTp1Dollar.toFixed(2), "#34d399"],
+                  ["TP2 Profit", "+$" + liveTp2Dollar.toFixed(2), "#34d399"]
+                ].map(([label, value, color]) =>
+                  h("div", { key: label, style: { background: "#060d1a", borderRadius: 6, padding: "6px 8px" } },
+                    h("div", { style: { fontSize: 9, color: "#4a6080" } }, label),
+                    h("div", { style: { fontSize: 13, fontWeight: 700, color, fontFamily: "monospace" } }, value)
+                  )
+                )
+              ),
+              accountBalance && h("div", { style: { marginTop: 6, padding: "6px 8px", background: "#060d1a", borderRadius: 6, display: "flex", justifyContent: "space-between" } },
+                h("span", { style: { fontSize: 10, color: "#4a6080" } }, "Recommended Lot (1% rule)"),
+                h("span", { style: { fontSize: 12, fontWeight: 700, color: "#fbbf24", fontFamily: "monospace" } }, accountPlan.finalSuggestedLot || "-")
+              ),
+              accountBalance && h("div", { style: { marginTop: 6, padding: "6px 8px", background: "#060d1a", borderRadius: 6, border: "1px solid " + (accountPlan.walletStatus === "COMFORTABLE" ? "#34d39933" : accountPlan.walletStatus === "HIGH_BUT_VALID" ? "#f59e0b33" : accountPlan.walletStatus === "TOO_SMALL" ? "#f8717133" : "#1a2d4a"), color: accountPlan.walletStatus === "COMFORTABLE" ? "#34d399" : accountPlan.walletStatus === "HIGH_BUT_VALID" ? "#f59e0b" : accountPlan.walletStatus === "TOO_SMALL" ? "#f87171" : "#94a3b8", fontSize: 10, lineHeight: 1.5 } },
+                accountPlan.walletStatus === "COMFORTABLE"
+                  ? "Wallet fit: even 0.01 lot stays inside a safe risk zone for this setup."
+                  : accountPlan.walletStatus === "HIGH_BUT_VALID"
+                    ? "Wallet fit: 0.01 lot is tradable, but risk is elevated. Use caution."
+                    : accountPlan.walletStatus === "TOO_SMALL"
+                      ? "Wallet fit: 0.01 lot is too large for this setup. Skip or use a bigger wallet."
+                      : "Enter balance to check whether the wallet can support this setup."
+              )
+            ),
+            h("div", { style: { ...S.card, background: displayAnalysis.signal === "BUY" ? "#021a0f" : displayAnalysis.signal === "SELL" ? "#1a0505" : "#0d1629", border: "2px solid " + sigCol + "55", textAlign: "center", padding: "14px 10px", animation: displayAnalysis.signal !== "WAIT" ? "glow 2s infinite" : "none" } },
+              h("div", { style: { fontSize: 9, color: "#4a6080", letterSpacing: 1, marginBottom: 4 } }, "SIGNAL"),
+              h("div", { style: { fontSize: 36, fontWeight: 900, color: sigCol, letterSpacing: 2, lineHeight: 1.1 } }, displayAnalysis.signal),
+              h("div", { style: { marginTop: 6 } },
+                h("div", { style: { fontSize: 11, color: "#4a6080", marginBottom: 4 } }, displayAnalysis.confidence + "% confidence"),
+                h("div", { style: { height: 4, background: "#1a2540", borderRadius: 2, overflow: "hidden" } },
+                  h("div", { style: { width: displayAnalysis.confidence + "%", height: "100%", background: sigCol, borderRadius: 2, transition: "width 0.6s ease" } })
+                )
+              ),
+              h("div", { style: { marginTop: 8, display: "flex", justifyContent: "center", gap: 4 } },
+                ["M5", "M15", "H1"].map(tfLabel => {
+                  const mtfSig = mtfConfluence?.[tfLabel] || "WAIT";
+                  const c = mtfSig === "BUY" ? "#34d399" : mtfSig === "SELL" ? "#f87171" : "#2a4060";
+                  return h("div", { key: tfLabel, style: { background: c + "22", border: "1px solid " + c + "55", borderRadius: 4, padding: "2px 6px", fontSize: 9, color: c, fontWeight: 700 } }, tfLabel + " " + mtfSig);
+                })
+              ),
+              newsBlock && h("div", { style: { marginTop: 6, padding: "4px 8px", background: "#2d1500", border: "1px solid #f59e0b55", borderRadius: 4, fontSize: 10, color: "#f59e0b" } }, "NEWS BLOCK ACTIVE")
+            ),
+            levels && displayAnalysis.signal !== "WAIT" && h("div", { style: S.card },
+              h("div", { style: { fontSize: 9, color: "#4a6080", letterSpacing: 1, marginBottom: 8 } }, "TRADE PLAN"),
+              [
+                ["ENTRY", viewPrice.toFixed(2), "#e2e8f0", true],
+                ["STOP LOSS", levels.stop.toFixed(2) + (accountBalance && tradeRate ? " (-$" + liveRiskDollar.toFixed(0) + ")" : ""), "#f87171", true],
+                ["TP 1", levels.tp1.toFixed(2) + (accountBalance && tradeRate ? " (+$" + liveTp1Dollar.toFixed(0) + ")" : ""), "#34d399", true],
+                ["TP 2", levels.tp2.toFixed(2) + (accountBalance && tradeRate ? " (+$" + liveTp2Dollar.toFixed(0) + ")" : ""), "#34d399", true],
+                ["R:R", "1:" + levels.rr.toFixed(2), levels.rr >= 2 ? "#34d399" : levels.rr >= 1.5 ? "#f59e0b" : "#f87171", false]
+              ].map(([label, value, color, money]) =>
+                h("div", { key: label, style: { display: "flex", justifyContent: "space-between", padding: "5px 0", borderBottom: "1px solid #0f172a" } },
+                  h("span", { style: { fontSize: 10, color: "#4a6080" } }, label),
+                  h("span", { style: { fontSize: 11, fontWeight: 700, color, fontFamily: "monospace" } }, (money ? "$" : "") + value)
+                )
+              )
+            ),
+            accountBalance && h("div", { style: { ...S.card, borderColor: accountPlan.walletStatus === "TOO_SMALL" ? "#f8717155" : "#1a2d4a" } },
+              h("div", { style: { fontSize: 9, color: "#4a6080", letterSpacing: 1, marginBottom: 8 } }, "WALLET SUITABILITY"),
+              h("div", { style: { fontSize: 11, color: accountPlan.walletStatus === "COMFORTABLE" ? "#34d399" : accountPlan.walletStatus === "HIGH_BUT_VALID" ? "#f59e0b" : accountPlan.walletStatus === "TOO_SMALL" ? "#f87171" : "#94a3b8", lineHeight: 1.7 } },
+                accountPlan.walletStatus === "COMFORTABLE"
+                  ? "This wallet can support the current structure at the broker minimum lot."
+                  : accountPlan.walletStatus === "HIGH_BUT_VALID"
+                    ? "This wallet can trade the setup, but the minimum lot pushes risk near the aggressive zone."
+                    : accountPlan.walletStatus === "TOO_SMALL"
+                      ? "This wallet is too small for the current setup at the broker minimum 0.01 lot."
+                      : "Set a wallet balance to evaluate suitability."
+              )
+            ),
+            newsEvents.length > 0 && h("div", { style: S.card },
+              h("div", { style: { fontSize: 9, color: "#4a6080", letterSpacing: 1, marginBottom: 6 } }, "HIGH-IMPACT NEWS"),
+              newsEvents.slice(0, 3).map((e, i) =>
+                h("div", { key: i, style: { padding: "5px 0", borderBottom: "1px solid #0f172a", fontSize: 10 } },
+                  h("div", { style: { color: "#f59e0b", fontWeight: 700 } }, e.title),
+                  h("div", { style: { color: "#4a6080", marginTop: 2 } }, new Date(e.time).toLocaleTimeString() + " | Actual: " + e.actual + " | Forecast: " + e.forecast)
+                )
+              )
+            ),
+            h("div", { style: { ...S.card, borderColor: prediction ? predictionColor + "55" : "#1a2d4a" } },
+              h("div", { style: { display: "flex", justifyContent: "space-between", alignItems: "center", marginBottom: 8, gap: 8 } },
+                h("div", { style: { fontSize: 9, color: "#4a6080", letterSpacing: 1 } }, "AI PREDICTION"),
+                h("button", { onClick: runPrediction, style: { ...S.btn("#a78bfa"), padding: "5px 10px" } }, predictionLoading ? "RUNNING..." : "AI PREDICT")
+              ),
+              forecastError && h("div", { style: { fontSize: 10, color: "#f87171", marginBottom: 8, lineHeight: 1.6 } }, forecastError),
+              !prediction && h("div", { style: { fontSize: 11, color: "#64748b", lineHeight: 1.7 } }, "Run the separate 5 to 10 minute forecast engine to project direction, entry, stop, and target levels."),
+              prediction && h("div", { style: { display: "flex", flexDirection: "column", gap: 7 } },
+                h("div", { style: { display: "flex", justifyContent: "space-between", alignItems: "center" } },
+                  h("div", { style: { fontSize: 22, fontWeight: 700, color: predictionColor, letterSpacing: 2 } }, prediction.signal),
+                  h("div", { style: { color: predictionColor, fontSize: 11 } }, prediction.confidence + "% forecast confidence")
+                ),
+                [["Entry", prediction.entry], ["Stop", prediction.stop], ["5m", prediction.forecast5], ["10m", prediction.forecast10], ["TP1", prediction.tp1], ["TP2", prediction.tp2], ["TP3", prediction.tp3], ["Lot", accountPlan.finalSuggestedLot], ["R:R", prediction.rrRatio || 0]].map(([label, value]) => h("div", { key: label, style: { display: "flex", justifyContent: "space-between", fontSize: 11, color: "#64748b" } }, h("span", null, label), h("span", { style: { color: "#e2e8f0", fontWeight: 700, fontFamily: "monospace" } }, typeof value === "number" && label !== "Lot" && label !== "R:R" ? "$" + value.toFixed(2) : label === "R:R" ? "1:" + Number(value).toFixed(2) : String(value)))),
+                prediction.tradeQuality && h("div", { style: { fontSize: 10, color: "#fbbf24" } }, "Quality " + prediction.tradeQuality + " | Bias " + prediction.marketBias + " | News risk " + prediction.newsRisk),
+                prediction.risks?.length > 0 && h("div", { style: { fontSize: 10, color: "#f59e0b", lineHeight: 1.5 } }, prediction.risks.join(" ")),
+                h("div", { style: { marginTop: 3, fontSize: 10, color: "#94a3b8", lineHeight: 1.65 } }, prediction.reasons.join(" "))
+              )
+            )
+          )
+        ),
+        h("div", { className: "tp-row", style: { display: "flex", gap: 8 } },
+          h("div", { style: S.tpBox("#60a5fa") }, h("div", { style: { fontSize: 9, color: "#4a6080", letterSpacing: 1, marginBottom: 3 } }, "ENTRY"), h("div", { style: { fontSize: 17, fontWeight: 700, color: "#60a5fa", fontFamily: "monospace" } }, "$" + viewPrice.toFixed(2))),
+          h("div", { style: S.tpBox("#f87171") }, h("div", { style: { fontSize: 9, color: "#4a6080", letterSpacing: 1, marginBottom: 3 } }, "STOP LOSS"), h("div", { style: { fontSize: 17, fontWeight: 700, color: "#f87171", fontFamily: "monospace" } }, "$" + levels.stop.toFixed(2)), accountBalance && tradeRate ? h("div", { style: { fontSize: 10, color: "#f87171", marginTop: 3 } }, "Risk: $" + liveRiskDollar.toFixed(2) + " (" + liveRiskPct.toFixed(1) + "% balance)") : h("div", { style: { fontSize: 10, color: "#2a4060" } }, "Enter balance to see $ risk")),
+          h("div", { style: S.tpBox("#34d399") }, h("div", { style: { fontSize: 9, color: "#4a6080", letterSpacing: 1, marginBottom: 3 } }, "TP 1"), h("div", { style: { fontSize: 17, fontWeight: 700, color: "#34d399", fontFamily: "monospace" } }, "$" + levels.tp1.toFixed(2)), accountBalance && tradeRate ? h("div", { style: { fontSize: 10, color: "#34d399", marginTop: 3 } }, "+$" + liveTp1Dollar.toFixed(2) + " potential") : h("div", { style: { fontSize: 9, color: "#2a4060" } }, "First reaction target")),
+          h("div", { style: S.tpBox("#a78bfa") }, h("div", { style: { fontSize: 9, color: "#4a6080", letterSpacing: 1, marginBottom: 3 } }, "TP 2"), h("div", { style: { fontSize: 17, fontWeight: 700, color: "#a78bfa", fontFamily: "monospace" } }, "$" + levels.tp2.toFixed(2)), accountBalance && tradeRate ? h("div", { style: { fontSize: 10, color: "#34d399", marginTop: 3 } }, "+$" + liveTp2Dollar.toFixed(2) + " potential") : h("div", { style: { fontSize: 9, color: "#2a4060" } }, "Trend extension target")),
+          h("div", { style: { ...S.tpBox("#fbbf24"), flexBasis: "140px" } }, h("div", { style: { fontSize: 9, color: "#4a6080", letterSpacing: 1, marginBottom: 3 } }, "R:R / RISK"), h("div", { style: { fontSize: 17, fontWeight: 700, color: "#fbbf24" } }, "1:" + levels.rr.toFixed(2)), h("div", { style: { fontSize: 9, color: accountPlan.riskPct <= 1 ? "#34d399" : accountPlan.riskPct <= 2 ? "#fbbf24" : "#f87171" } }, accountPlan.riskPct.toFixed(2) + "% balance"))
+        ),
+        h("div", { style: { ...S.card, borderColor: accountPlan.walletStatus === "TOO_SMALL" ? "#f8717155" : "#1a2d4a" } },
+          h("div", { style: { fontSize: 9, color: "#4a6080", letterSpacing: 1, marginBottom: 10 } }, "WALLET BASED PLAN"),
+          h("div", { style: { display: "grid", gridTemplateColumns: "1.2fr 1fr 1fr 1fr", gap: 8 } },
+            [
+              ["Setup Levels", "Entry $" + viewPrice.toFixed(2) + " | SL $" + levels.stop.toFixed(2) + " | TP1 $" + levels.tp1.toFixed(2), "#cbd5e1"],
+              ["Min Balance (1%)", "$" + accountPlan.requiredBalance1Pct.toFixed(2), "#34d399"],
+              ["Min Balance (2%)", "$" + accountPlan.requiredBalance2Pct.toFixed(2), "#fbbf24"],
+              ["Min Balance (3%)", "$" + accountPlan.requiredBalance3Pct.toFixed(2), "#f59e0b"]
+            ].map(([label, value, color]) =>
+              h("div", { key: label, style: { background: "#060d1a", borderRadius: 8, padding: "8px 10px", border: "1px solid #1a2d4a" } },
+                h("div", { style: { fontSize: 9, color: "#4a6080", marginBottom: 4 } }, label),
+                h("div", { style: { fontSize: 12, fontWeight: 700, color, fontFamily: "monospace", lineHeight: 1.5 } }, value)
+              )
+            )
+          ),
+          h("div", { style: { marginTop: 8, display: "grid", gridTemplateColumns: "1fr 1fr 1fr", gap: 8 } },
+            [
+              ["0.01 Lot Risk", "$" + accountPlan.minLotRiskDollar.toFixed(2), accountPlan.minLotRiskPct <= 3 ? "#e2e8f0" : "#f87171"],
+              ["0.01 Lot TP1", "+$" + accountPlan.minLotTp1Dollar.toFixed(2), "#34d399"],
+              ["0.01 Lot TP2", "+$" + accountPlan.minLotTp2Dollar.toFixed(2), "#34d399"]
+            ].map(([label, value, color]) =>
+              h("div", { key: label, style: { background: "#060d1a", borderRadius: 8, padding: "8px 10px", border: "1px solid #1a2d4a" } },
+                h("div", { style: { fontSize: 9, color: "#4a6080", marginBottom: 4 } }, label),
+                h("div", { style: { fontSize: 12, fontWeight: 700, color, fontFamily: "monospace" } }, value)
+              )
+            )
+          ),
+          h("div", { style: { marginTop: 8, fontSize: 11, lineHeight: 1.7, color: accountPlan.walletStatus === "COMFORTABLE" ? "#34d399" : accountPlan.walletStatus === "HIGH_BUT_VALID" ? "#f59e0b" : accountPlan.walletStatus === "TOO_SMALL" ? "#f87171" : "#94a3b8" } },
+            accountPlan.walletStatus === "COMFORTABLE"
+              ? "Wallet verdict: the current balance can support this setup with the broker minimum 0.01 lot."
+              : accountPlan.walletStatus === "HIGH_BUT_VALID"
+                ? "Wallet verdict: 0.01 lot can be used, but the setup is aggressive for this balance. Risk control matters."
+                : accountPlan.walletStatus === "TOO_SMALL"
+                  ? "Wallet verdict: this setup is too large for the current balance at the broker minimum 0.01 lot. Wait for a tighter setup or use a larger wallet."
+                  : "Enter wallet details to calculate the minimum balance needed for this setup."
+          )
+        ),
+        h("div", { className: "stats-grid", style: { display: "grid", gridTemplateColumns: "1fr 1fr 1fr", gap: 10 } },
+          h("div", { style: S.card }, h("div", { style: { fontSize: 9, color: "#4a6080", letterSpacing: 1, marginBottom: 10 } }, "OSCILLATORS"), ind && h(Bar, { label: "RSI (14)", val: ind.rsi, color: ind.rsi < 30 ? "#34d399" : ind.rsi > 70 ? "#f87171" : "#60a5fa" }), ind && h(Bar, { label: "Stochastic", val: ind.stoch, color: ind.stoch < 20 ? "#34d399" : ind.stoch > 80 ? "#f87171" : "#f59e0b" }), ind && h(Bar, { label: "ATR %", val: marketState.atrPct, min: 0, max: 1.5, color: "#a78bfa", fmt: v => v.toFixed(2) + "%" })),
+          h("div", { style: S.card },
+            h("div", { style: { fontSize: 9, color: "#4a6080", letterSpacing: 1, marginBottom: 10 } }, "TREND"),
+            ind && [["EMA 21", "$" + ind.ema21.toFixed(2), viewPrice > ind.ema21 ? "#34d399" : "#f87171"], ["EMA 50", "$" + ind.ema50.toFixed(2), viewPrice > ind.ema50 ? "#34d399" : "#f87171"], ["MACD", ind.macd.macd.toFixed(3), ind.macd.macd > ind.macd.signal ? "#34d399" : "#f87171"], ["ADX", ind.dmi.adx.toFixed(1), ind.dmi.adx >= 20 ? "#fbbf24" : "#64748b"], ["+DI / -DI", ind.dmi.plusDI.toFixed(1) + " / " + ind.dmi.minusDI.toFixed(1), ind.dmi.plusDI > ind.dmi.minusDI ? "#34d399" : "#f87171"], ["Momentum", marketState.momentum.toFixed(2) + "%", marketState.momentum >= 0 ? "#34d399" : "#f87171"]].map(([label, value, color]) => h("div", { key: label, style: { display: "flex", justifyContent: "space-between", fontSize: 11, padding: "4px 0", borderBottom: "1px solid #0f172a", color: "#64748b" } }, h("span", null, label), h("span", { style: { color, fontWeight: 700, fontFamily: "monospace" } }, value)))
+          ),
+          h("div", { style: S.card },
+            h("div", { style: { fontSize: 9, color: "#4a6080", letterSpacing: 1, marginBottom: 10 } }, "LEVEL MAP"),
+            h("div", { style: { display: "grid", gap: 6 } }, [["Near Support", levels.support, "#34d399"], ["Near Resistance", levels.resistance, "#f87171"], ["Stop", levels.stop, "#f87171"], ["TP1", levels.tp1, "#34d399"], ["TP2", levels.tp2, "#a78bfa"]].map(([label, value, color]) => h("div", { key: label, style: { display: "flex", justifyContent: "space-between", fontSize: 11, color: "#4a6080" } }, h("span", null, label), h("span", { style: { color, fontFamily: "monospace", fontWeight: 700 } }, "$" + value.toFixed(2)))))
+          )
+        )
+      ),
+      tab === "signals" && h("div", { style: { display: "flex", flexDirection: "column", gap: 12 } },
+        h("div", { className: "signal-grid", style: { display: "grid", gridTemplateColumns: "1fr 1fr", gap: 12 } },
+          h("div", { style: S.card }, h("div", { style: { fontSize: 9, color: "#4a6080", letterSpacing: 1, marginBottom: 10 } }, "SIGNAL CONFLUENCE"), h("div", { style: { display: "flex", flexWrap: "wrap", gap: 5 } }, analysis.reasons.map((r, i) => h("div", { key: i, style: { background: r.dir === "buy" ? "#02160a" : r.dir === "sell" ? "#160202" : "#0a1220", color: r.dir === "buy" ? "#34d399" : r.dir === "sell" ? "#f87171" : "#94a3b8", border: "1px solid " + (r.dir === "buy" ? "#34d39930" : r.dir === "sell" ? "#f8717130" : "#60a5fa30"), borderRadius: 5, padding: "4px 8px", fontSize: 10, fontWeight: 600 } }, (r.dir === "buy" ? "▲ " : r.dir === "sell" ? "▼ " : "• ") + r.text)))),
+          h("div", { style: S.card }, h("div", { style: { fontSize: 9, color: "#4a6080", letterSpacing: 1, marginBottom: 10 } }, "TRADE METRICS"), [["Entry", "$" + viewPrice.toFixed(2), "#60a5fa"], ["Stop Loss", "$" + levels.stop.toFixed(2), "#f87171"], ["TP 1", "$" + levels.tp1.toFixed(2), "#34d399"], ["TP 2", "$" + levels.tp2.toFixed(2), "#a78bfa"], ["Support", "$" + levels.support.toFixed(2), "#34d399"], ["Resistance", "$" + levels.resistance.toFixed(2), "#f87171"], ["Recommended Lot (1% rule)", accountPlan.optimalLot > 0 ? accountPlan.optimalLot.toFixed(2) : "Enter balance", "#fbbf24"], ["Suggested Lot", accountPlan.finalSuggestedLot.toFixed(2), "#60a5fa"], ["Risk $", "$" + accountPlan.riskDollar.toFixed(2), accountPlan.riskPct <= 1 ? "#34d399" : accountPlan.riskPct <= 2 ? "#fbbf24" : "#f87171"], ["Risk %", accountPlan.riskPct.toFixed(2) + "%", accountPlan.riskPct <= 1 ? "#34d399" : accountPlan.riskPct <= 2 ? "#fbbf24" : "#f87171"], ["Margin", "$" + accountPlan.marginRequired.toFixed(2), accountPlan.marginPct <= 25 ? "#34d399" : accountPlan.marginPct <= 50 ? "#fbbf24" : "#f87171"], ["R:R Ratio", "1:" + levels.rr.toFixed(2), "#fbbf24"], ["MTF", mtfConfluence ? mtfConfluence.confluence.replace("_", " ") : "Loading", mtfConfluence?.aligned ? "#34d399" : "#f59e0b"]].map(([label, value, color]) => h("div", { key: label, style: { display: "flex", justifyContent: "space-between", padding: "5px 0", borderBottom: "1px solid #0d1a2e", fontSize: 11 } }, h("span", { style: { color: "#64748b" } }, label), h("span", { style: { color, fontWeight: 700, fontFamily: "monospace" } }, value))))
+        ),
+        h("div", { style: S.card },
+          h("div", { style: { fontSize: 9, color: "#4a6080", letterSpacing: 1, marginBottom: 10 } }, "ALL INDICATORS"),
+          ind && h("table", null, h("thead", null, h("tr", { style: { color: "#2a4060" } }, ["Indicator", "Value", "Signal", "Strength"].map(c => h("th", { key: c }, c)))), h("tbody", null, [["RSI (14)", ind.rsi.toFixed(1), ind.rsi < 30 ? "BUY" : ind.rsi > 70 ? "SELL" : "NEUTRAL", ind.rsi < 30 || ind.rsi > 70 ? "STRONG" : "WEAK"], ["MACD", ind.macd.macd.toFixed(3), ind.macd.macd > ind.macd.signal ? "BUY" : "SELL", "MODERATE"], ["Stochastic", ind.stoch.toFixed(1), ind.stoch < 20 ? "BUY" : ind.stoch > 80 ? "SELL" : "NEUTRAL", ind.stoch < 20 || ind.stoch > 80 ? "STRONG" : "WEAK"], ["EMA Structure", ind.ema21.toFixed(2) + " / " + ind.ema50.toFixed(2), ind.ema21 > ind.ema50 ? "BUY" : "SELL", "MODERATE"], ["Volatility", marketState.atrPct.toFixed(2) + "%", marketState.volatility.toUpperCase(), marketState.quality], ["Momentum", marketState.momentum.toFixed(2) + "%", marketState.momentum >= 0 ? "BUY" : "SELL", Math.abs(marketState.momentum) > 0.35 ? "STRONG" : "WEAK"]].map(([name, value, sig, str], i) => h("tr", { key: i }, h("td", { style: { color: "#64748b" } }, name), h("td", { style: { color: "#94a3b8", fontFamily: "monospace" } }, value), h("td", null, h("span", { style: { color: sig === "BUY" ? "#34d399" : sig === "SELL" ? "#f87171" : "#64748b", fontWeight: 700, fontSize: 10 } }, sig)), h("td", null, h("span", { style: { color: str === "STRONG" || str === "A-grade" ? "#fbbf24" : str === "HIGH" || str === "MODERATE" || str === "B-grade" ? "#60a5fa" : "#2a4060", fontSize: 10 } }, str))))))
+        )
+      ),
+      tab === "alarms" && h("div", { className: "alarm-grid", style: { display: "grid", gridTemplateColumns: "300px 1fr", gap: 12 } },
+        h("div", { style: { display: "flex", flexDirection: "column", gap: 10 } },
+          h("div", { style: S.card },
+            h("div", { style: { fontSize: 9, color: "#4a6080", letterSpacing: 1, marginBottom: 12 } }, "NEW ALARM"),
+            h("div", { style: { marginBottom: 10 } }, h("div", { style: { fontSize: 9, color: "#4a6080", marginBottom: 5, letterSpacing: 1 } }, "TYPE"), h("div", { style: { display: "flex", gap: 6 } }, ["price", "signal"].map(type => h("button", { key: type, onClick: () => setAType(type), style: { ...S.btn(aType === type ? "#fbbf24" : "#2a4060"), flex: 1 } }, type.toUpperCase())))),
+            aType === "price" && h("div", null,
+              h("div", { style: { marginBottom: 8 } }, h("div", { style: { fontSize: 9, color: "#4a6080", marginBottom: 4, letterSpacing: 1 } }, "PRICE LEVEL ($)"), h("input", { style: S.inp, type: "number", step: "0.01", placeholder: "e.g. " + (price + 10).toFixed(2), value: aVal, onChange: e => setAVal(e.target.value) })),
+              h("div", { style: { marginBottom: 8 } }, h("div", { style: { fontSize: 9, color: "#4a6080", marginBottom: 5, letterSpacing: 1 } }, "TRIGGER WHEN PRICE IS"), h("div", { style: { display: "flex", gap: 6 } }, [["above", "▲ ABOVE", "#34d399"], ["below", "▼ BELOW", "#f87171"]].map(([dir, label, color]) => h("button", { key: dir, onClick: () => setADir(dir), style: { ...S.btn(aDir === dir ? color : "#2a4060"), flex: 1 } }, label))))
+            ),
+            aType === "signal" && h("div", { style: { marginBottom: 8 } }, h("div", { style: { fontSize: 9, color: "#4a6080", marginBottom: 5, letterSpacing: 1 } }, "TRIGGER ON SIGNAL"), h("div", { style: { display: "flex", gap: 6 } }, [["BUY", "#34d399"], ["SELL", "#f87171"], ["WAIT", "#f59e0b"]].map(([sig, color]) => h("button", { key: sig, onClick: () => setASig(sig), style: { ...S.btn(aSig === sig ? color : "#2a4060"), flex: 1 } }, sig)))),
+            h("div", { style: { marginBottom: 12 } }, h("div", { style: { fontSize: 9, color: "#4a6080", marginBottom: 5, letterSpacing: 1 } }, "ALERT DURATION - " + aDur + "s"), h("input", { type: "range", min: 1, max: 4, step: 1, value: aDur, onChange: e => setADur(+e.target.value), style: { width: "100%", accentColor: "#fbbf24" } })),
+            h("button", { onClick: () => { if (aType === "price" && !aVal) return; const id = ++alarmIdRef.current; setAlarms(prevAlarms => [...prevAlarms, { id, type: aType, dir: aDir, val: parseFloat(aVal), sig: aSig, dur: aDur, triggered: false, createdAt: Date.now() }]); setAVal(""); addNotif("Alarm saved locally", "info"); }, style: { ...S.btn("#fbbf24"), width: "100%", padding: "9px", fontSize: 12 } }, "+ ADD ALARM"),
+            h("div", { style: { marginTop: 8, background: "#060d1a", borderRadius: 6, padding: "6px 10px", fontSize: 10, color: "#2a4060" } }, "Live price: ", h("span", { style: { color: "#fbbf24", fontFamily: "monospace" } }, "$" + price.toFixed(2)))
+          ),
+          h("div", { style: S.card }, h("div", { style: { fontSize: 9, color: "#4a6080", letterSpacing: 1, marginBottom: 8 } }, "ALARM NOTES"), h("div", { style: { fontSize: 11, color: "#64748b", lineHeight: 1.7 } }, "Alarms now persist in local storage, so refreshes do not wipe them. Triggered alarms remain visible until you clear or delete them."))
+        ),
+        h("div", { style: { ...S.card, minHeight: 200 } },
+          h("div", { style: { display: "flex", justifyContent: "space-between", alignItems: "center", marginBottom: 12 } }, h("div", { style: { fontSize: 9, color: "#4a6080", letterSpacing: 1 } }, "ACTIVE ALARMS (" + alarms.length + ")"), alarms.length > 0 && h("button", { onClick: () => setAlarms([]), style: S.btn("#f87171") }, "CLEAR ALL")),
+          alarms.length === 0 ? h("div", { style: { textAlign: "center", padding: "50px 0", color: "#1a2d4a", fontSize: 12 } }, "No alarms configured") : alarms.map(a => h("div", { key: a.id, style: { display: "flex", alignItems: "center", gap: 8, padding: "9px 10px", background: "#060d1a", borderRadius: 8, border: "1px solid " + (a.triggered ? "#f8717130" : "#1a2d4a"), marginBottom: 6, animation: a.triggered ? "none" : "fadeIn 0.3s" } }, h("div", { style: { width: 7, height: 7, borderRadius: "50%", background: a.triggered ? "#f87171" : "#34d399", flexShrink: 0, animation: !a.triggered ? "pulse 2s infinite" : "none" } }), h("div", { style: { flex: 1 } }, h("div", { style: { color: "#c0d0e0", fontSize: 11, fontWeight: 600 } }, a.type === "price" ? (a.dir === "above" ? "▲ " : "▼ ") + "Price " + a.dir + " $" + a.val.toFixed(2) : "Signal: " + a.sig), h("div", { style: { color: "#2a4060", fontSize: 10 } }, a.triggered ? "TRIGGERED - " + new Date(a.triggeredAt || Date.now()).toLocaleTimeString() : "Watching... " + a.dur + "s alarm")), h("button", { onClick: () => setAlarms(prevAlarms => prevAlarms.filter(x => x.id !== a.id)), style: { background: "none", border: "none", color: "#2a4060", cursor: "pointer", fontSize: 16, padding: "0 4px", lineHeight: 1 } }, "×")))
+        )
+      ),
+      tab === "analysis" && h("div", { style: { display: "flex", flexDirection: "column", gap: 12 } },
+        h("div", { className: "ai-grid", style: { display: "grid", gridTemplateColumns: "repeat(4,1fr)", gap: 8 } }, [["Current Price", "$" + viewPrice.toFixed(2), pCol], ["RSI", ind ? ind.rsi.toFixed(1) : "-", ind ? (ind.rsi < 30 ? "#34d399" : ind.rsi > 70 ? "#f87171" : "#94a3b8") : "#94a3b8"], ["ATR", ind ? "$" + ind.atr.toFixed(2) : "-", "#f59e0b"], ["Trend", marketState.trend, marketState.trend === "Uptrend" ? "#34d399" : marketState.trend === "Downtrend" ? "#f87171" : "#94a3b8"]].map(([label, value, color]) => h("div", { key: label, style: { ...S.card, textAlign: "center" } }, h("div", { style: { fontSize: 9, color: "#4a6080", letterSpacing: 1, marginBottom: 4 } }, label), h("div", { style: { fontSize: 18, fontWeight: 700, color, fontFamily: "monospace" } }, value)))),
+        h("div", { style: { display: "flex", alignItems: "center", gap: 12, flexWrap: "wrap" } }, h("button", { onClick: () => setBrief({ text: buildStrategyBrief(viewPrice, prev, ind, analysis, levels, marketState, viewHistory, accountPlan), time: new Date(), signal: analysis.signal, price: viewPrice.toFixed(2) }), style: { ...S.btn("#a78bfa"), padding: "10px 24px", fontSize: 12 } }, "GENERATE STRATEGY BRIEF"), h("div", { style: { fontSize: 10, color: "#2a4060" } }, "Local deterministic analysis built from live indicators, levels, and trend structure")),
+        brief && h("div", { style: S.card }, h("div", { style: { display: "flex", justifyContent: "space-between", alignItems: "center", marginBottom: 12, paddingBottom: 10, borderBottom: "1px solid #1a2d4a", gap: 8, flexWrap: "wrap" } }, h("div", { style: { fontSize: 9, color: "#4a6080", letterSpacing: 1 } }, "MARKET BRIEF - " + new Date(brief.time).toLocaleTimeString() + " - Price at analysis: $" + brief.price), brief.signal && h("div", { style: S.pill(sigCol) }, brief.signal)), h("div", { style: { fontSize: 12, color: "#94a3b8", lineHeight: 1.95, whiteSpace: "pre-wrap", fontFamily: "monospace" } }, brief.text)),
+        !brief && h("div", { style: { ...S.card, textAlign: "center", padding: "60px 20px" } }, h("div", { style: { fontSize: 14, color: "#1a3050", letterSpacing: 1 } }, "GENERATE A LOCAL STRATEGY BRIEF"), h("div", { style: { fontSize: 11, color: "#0f2240", marginTop: 8 } }, "This replaces the broken third-party AI call with a reliable on-page analysis engine"))
+      ),
+      tab === "intel" && h("div", { style: { display: "flex", flexDirection: "column", gap: 12 } },
+        h("div", { style: S.card },
+          h("div", { style: { fontSize: 9, color: "#4a6080", letterSpacing: 1, marginBottom: 10 } }, "ALL INDICATORS - LIVE"),
+          h("table", null,
+            h("thead", null, h("tr", null, ["Indicator", "Value", "Signal", "Weight", "Strength"].map(col => h("th", { key: col, style: { color: "#4a6080", fontSize: 10 } }, col)))),
+            h("tbody", null,
+              [
+                ["RSI (14)", ind?.rsi?.toFixed(1), ind?.rsi > 70 ? "SELL" : ind?.rsi < 30 ? "BUY" : "NEUTRAL", "High", ind?.rsi > 70 || ind?.rsi < 30 ? "STRONG" : "WEAK"],
+                ["MACD", ind?.macd?.macd?.toFixed(3), ind?.macd?.macd > ind?.macd?.signal ? "BUY" : "SELL", "High", Math.abs((ind?.macd?.macd || 0) - (ind?.macd?.signal || 0)) > 1 ? "STRONG" : "MODERATE"],
+                ["Stochastic", ind?.stoch?.toFixed(1), ind?.stoch > 85 ? "SELL" : ind?.stoch < 15 ? "BUY" : "NEUTRAL", "Medium", ind?.stoch > 85 || ind?.stoch < 15 ? "STRONG" : "WEAK"],
+                ["EMA Structure", (ind?.ema21?.toFixed(2) || "-") + " / " + (ind?.ema50?.toFixed(2) || "-"), viewPrice > (ind?.ema21 || 0) && (ind?.ema21 || 0) > (ind?.ema50 || 0) ? "BUY" : viewPrice < (ind?.ema21 || 0) && (ind?.ema21 || 0) < (ind?.ema50 || 0) ? "SELL" : "NEUTRAL", "High", "MODERATE"],
+                ["EMA 200", ind?.ema200?.toFixed(2), viewPrice > (ind?.ema200 || 0) ? "BUY" : "SELL", "High", "STRONG"],
+                ["ADX", ind?.dmi?.adx?.toFixed(1), ind?.dmi?.adx >= 25 ? "TREND" : "RANGE", "Medium", ind?.dmi?.adx >= 25 ? "STRONG" : "WEAK"],
+                ["DMI", "+DI:" + (ind?.dmi?.plusDI?.toFixed(1) || "-") + " -DI:" + (ind?.dmi?.minusDI?.toFixed(1) || "-"), (ind?.dmi?.plusDI || 0) > (ind?.dmi?.minusDI || 0) ? "BUY" : "SELL", "High", "MODERATE"],
+                ["ATR", "$" + (ind?.atr?.toFixed(2) || "-"), "VOLATILITY", "Info", ind?.atr ? ((ind.atr / viewPrice) * 100).toFixed(3) + "%" : "-"],
+                ["Bollinger", "B:" + (ind?.bb?.upper?.toFixed(2) || "-"), viewPrice > (ind?.bb?.middle || 0) ? "BUY" : "SELL", "Medium", "MODERATE"],
+                ["VWAP", "$" + (ind?.vwap?.toFixed(2) || "-"), viewPrice > (ind?.vwap || 0) ? "BUY" : "SELL", "High", "STRONG"],
+                ["OBV", ind?.obv?.trend, ind?.obv?.trend === "rising" ? "BUY" : ind?.obv?.trend === "falling" ? "SELL" : "NEUTRAL", "Medium", "MODERATE"],
+                ["Ichimoku", ind?.ichimoku ? (ind.ichimoku.aboveCloud ? "ABOVE CLOUD" : ind.ichimoku.belowCloud ? "BELOW CLOUD" : "IN CLOUD") : "N/A", ind?.ichimoku?.aboveCloud ? "BUY" : ind?.ichimoku?.belowCloud ? "SELL" : "NEUTRAL", "High", "STRONG"],
+                ["Momentum", (marketState?.momentum?.toFixed(3) || "0") + "%", (marketState?.momentum || 0) > 0 ? "BUY" : "SELL", "Medium", "MODERATE"],
+                ["Volatility", marketState?.volatility, "INFO", "Info", marketState?.atrPct?.toFixed(3) + "%"]
+              ].map(([label, value, signal, weight, strength]) => {
+                const sc = signal === "BUY" ? "#34d399" : signal === "SELL" ? "#f87171" : "#94a3b8";
+                return h("tr", { key: label },
+                  h("td", null, label),
+                  h("td", { style: { fontFamily: "monospace", color: "#c0d0e0" } }, value || "-"),
+                  h("td", null, h("span", { style: { ...S.pill(sc), fontSize: 9 } }, signal)),
+                  h("td", { style: { color: "#4a6080" } }, weight),
+                  h("td", { style: { color: strength === "STRONG" ? "#fbbf24" : "#4a6080" } }, strength)
+                );
+              })
+            )
+          )
+        ),
+        ind?.fib && h("div", { style: S.card },
+          h("div", { style: { fontSize: 9, color: "#4a6080", letterSpacing: 1, marginBottom: 8 } }, "FIBONACCI LEVELS"),
+          h("div", { style: { display: "grid", gridTemplateColumns: "repeat(4,1fr)", gap: 6 } },
+            [["Swing High", ind.fib.swing_high, "#f87171"], ["78.6%", ind.fib.fib786, "#f87171"], ["61.8%", ind.fib.fib618, "#f59e0b"], ["50%", ind.fib.fib500, "#94a3b8"], ["38.2%", ind.fib.fib382, "#f59e0b"], ["23.6%", ind.fib.fib236, "#34d399"], ["Swing Low", ind.fib.swing_low, "#34d399"], ["Current", viewPrice, "#fbbf24"]].map(([label, val, color]) =>
+              h("div", { key: label, style: { background: "#060d1a", borderRadius: 6, padding: "6px 8px", border: Math.abs(viewPrice - val) < (ind?.atr || 10) ? "1px solid " + color + "55" : "1px solid #1a2d4a" } },
+                h("div", { style: { fontSize: 9, color: "#4a6080" } }, label),
+                h("div", { style: { fontSize: 12, fontWeight: 700, color, fontFamily: "monospace" } }, "$" + val?.toFixed(2))
+              )
+            )
+          )
+        ),
+        ind?.pivots && h("div", { style: S.card },
+          h("div", { style: { fontSize: 9, color: "#4a6080", letterSpacing: 1, marginBottom: 8 } }, "PIVOT POINTS (CLASSIC)"),
+          h("div", { style: { display: "grid", gridTemplateColumns: "repeat(7,1fr)", gap: 4 } },
+            [["R3", ind.pivots.R3, "#f87171"], ["R2", ind.pivots.R2, "#f87171"], ["R1", ind.pivots.R1, "#f87171"], ["P", ind.pivots.P, "#fbbf24"], ["S1", ind.pivots.S1, "#34d399"], ["S2", ind.pivots.S2, "#34d399"], ["S3", ind.pivots.S3, "#34d399"]].map(([label, val, color]) =>
+              h("div", { key: label, style: { background: "#060d1a", borderRadius: 6, padding: "6px 4px", textAlign: "center", border: Math.abs(viewPrice - val) < (ind?.atr || 10) * 0.5 ? "1px solid " + color + "77" : "1px solid #1a2d4a" } },
+                h("div", { style: { fontSize: 9, color, fontWeight: 700 } }, label),
+                h("div", { style: { fontSize: 10, color: "#94a3b8", fontFamily: "monospace", marginTop: 2 } }, "$" + val?.toFixed(1))
+              )
+            )
+          )
+        ),
+        h("div", { style: S.card },
+          h("div", { style: { fontSize: 9, color: "#4a6080", letterSpacing: 1, marginBottom: 8 } }, "CANDLE PATTERNS"),
+          ind?.patterns?.length > 0
+            ? ind.patterns.map((p, i) =>
+                h("div", { key: i, style: { display: "flex", justifyContent: "space-between", padding: "5px 0", borderBottom: "1px solid #0f172a" } },
+                  h("span", { style: { fontSize: 11, color: "#c0d0e0" } }, p.name),
+                  h("div", { style: { display: "flex", gap: 6 } },
+                    h("span", { style: S.pill(p.dir === "buy" ? "#34d399" : p.dir === "sell" ? "#f87171" : "#94a3b8") }, p.dir.toUpperCase()),
+                    h("span", { style: { fontSize: 10, color: p.strength === "strong" ? "#fbbf24" : "#4a6080" } }, p.strength)
+                  )
+                )
+              )
+            : h("div", { style: { fontSize: 11, color: "#2a4060", textAlign: "center", padding: "12px 0" } }, "No patterns detected on current candles")
+        ),
+        mtfConfluence && h("div", { style: S.card },
+          h("div", { style: { fontSize: 9, color: "#4a6080", letterSpacing: 1, marginBottom: 8 } }, "MULTI-TIMEFRAME CONFLUENCE"),
+          h("div", { style: { display: "grid", gridTemplateColumns: "repeat(4, 1fr)", gap: 8 } },
+            [["M5", mtfConfluence.M5], ["M15", mtfConfluence.M15], ["H1", mtfConfluence.H1], ["Overall", mtfConfluence.confluence]].map(([label, sig]) => {
+              const c = sig === "BUY" || sig === "STRONG_BUY" ? "#34d399" : sig === "SELL" || sig === "STRONG_SELL" ? "#f87171" : "#94a3b8";
+              return h("div", { key: label, style: { ...S.card, textAlign: "center", padding: "10px 6px" } },
+                h("div", { style: { fontSize: 9, color: "#4a6080", marginBottom: 4 } }, label),
+                h("div", { style: { fontSize: 14, fontWeight: 700, color: c } }, sig.replace("_", " "))
+              );
+            })
+          )
+        )
+      ),
+      tab === "data" && h("div", { style: { display: "grid", gridTemplateColumns: "360px 1fr", gap: 12 } },
+        h("div", { style: { display: "flex", flexDirection: "column", gap: 12 } },
+          h("div", { style: S.card },
+            h("div", { style: { fontSize: 9, color: "#4a6080", letterSpacing: 1, marginBottom: 12 } }, "LIVE DATA FEED"),
+            h("div", { style: { marginBottom: 10 } },
+              h("div", { style: { fontSize: 9, color: "#4a6080", marginBottom: 5, letterSpacing: 1 } }, "PROVIDER"),
+              h("div", { style: { display: "flex", gap: 6 } },
+                [["public", "PUBLIC"], ["twelvedata", "TWELVE DATA"]].map(([value, label]) => h("button", { key: value, onClick: () => setFeedProvider(value), style: { ...S.btn(feedProvider === value ? "#fbbf24" : "#2a4060"), flex: 1 } }, label))
+              )
+            ),
+            h("div", { style: { marginBottom: 10 } },
+              h("div", { style: { fontSize: 9, color: "#4a6080", marginBottom: 5, letterSpacing: 1 } }, "API KEY"),
+              h("input", { style: S.inp, type: "password", placeholder: feedProvider === "twelvedata" ? "Paste Twelve Data API key" : "Not required for public mode", value: apiKey, onChange: e => setApiKey(e.target.value) })
+            ),
+            h("div", { style: { marginBottom: 12 } },
+              h("div", { style: { fontSize: 9, color: "#4a6080", marginBottom: 5, letterSpacing: 1 } }, "REFRESH EVERY"),
+              h("select", { value: pollMs, onChange: e => setPollMs(+e.target.value), style: S.inp }, [
+                [1000, "1 second"],
+                [2000, "2 seconds"],
+                [5000, "5 seconds"],
+                [10000, "10 seconds"],
+                [60000, "1 minute"],
+                [120000, "2 minutes"]
+              ].map(([ms, label]) => h("option", { key: ms, value: ms }, label)))
+            ),
+            h("button", { onClick: () => { loadHistory(); fetchPrice(); }, style: { ...S.btn("#34d399"), width: "100%", padding: "9px", fontSize: 12 } }, "APPLY FEED NOW")
+          ),
+            h("div", { style: S.card },
+              h("div", { style: { fontSize: 9, color: "#4a6080", letterSpacing: 1, marginBottom: 8 } }, "STATUS"),
+              h("div", { style: { fontSize: 11, color: "#94a3b8", lineHeight: 1.8 } },
+                "Current source: ", h("span", { style: { color: "#fbbf24" } }, sourceLabel), h("br"),
+                "Displayed price: ", h("span", { style: { color: "#34d399", fontFamily: "monospace" } }, formatPrice(price) + " USD"), h("br"),
+                "Last candle (SLT): ", h("span", { style: { color: dataIsStale ? "#f87171" : "#60a5fa", fontFamily: "monospace" } }, formatSriLankaDateTime(latestViewCandleTime)), h("br"),
+                "Now (SLT): ", h("span", { style: { color: "#94a3b8", fontFamily: "monospace" } }, formatSriLankaDateTime(Date.now())), h("br"),
+                dataIsStale ? h("span", { style: { color: "#f87171" } }, "Chart is stale. Auto-reloading live history.") : h("span", { style: { color: "#34d399" } }, "Chart candles are within the live freshness window."), h("br"),
+                feedError ? h("span", { style: { color: "#f87171" } }, feedError) : "No feed errors"
+              )
+            ),
+          h("div", { style: S.card },
+            h("div", { style: { fontSize: 9, color: "#4a6080", letterSpacing: 1, marginBottom: 12 } }, "ACCOUNT RISK"),
+            h("div", { style: { marginBottom: 10 } },
+              h("div", { style: { fontSize: 9, color: "#4a6080", marginBottom: 5, letterSpacing: 1 } }, "BALANCE ($)"),
+              h("input", { style: S.inp, type: "number", step: "0.01", value: accountBalance, onChange: e => setAccountBalance(e.target.value), placeholder: "e.g. 1000" })
+            ),
+            h("div", { style: { marginBottom: 10 } },
+              h("div", { style: { fontSize: 9, color: "#4a6080", marginBottom: 5, letterSpacing: 1 } }, "TRADE RATE / LOT SIZE"),
+              h("input", { style: S.inp, type: "number", step: "0.01", value: tradeRate, onChange: e => setTradeRate(e.target.value), placeholder: "e.g. 0.10" })
+            ),
+            h("div", { style: { marginBottom: 10 } },
+              h("div", { style: { fontSize: 9, color: "#4a6080", marginBottom: 5, letterSpacing: 1 } }, "LEVERAGE"),
+              h("input", { style: S.inp, type: "number", step: "1", value: leverage, onChange: e => setLeverage(e.target.value), placeholder: "e.g. 100" })
+            ),
+            h("div", { style: { fontSize: 10, color: "#64748b", lineHeight: 1.7 } },
+              "Assumption: XAUUSD standard lot = 100 ounces. The engine now blocks weaker setups when stop-loss risk or estimated margin usage is too aggressive."
+            )
+          ),
+          h("div", { style: S.card },
+            h("div", { style: { fontSize: 9, color: "#4a6080", letterSpacing: 1, marginBottom: 12 } }, "FORECAST BRAIN"),
+            h("div", { style: { marginBottom: 10 } },
+              h("div", { style: { fontSize: 9, color: "#4a6080", marginBottom: 5, letterSpacing: 1 } }, "PROVIDER"),
+              h("div", { style: { display: "flex", gap: 6 } },
+                [["local", "LOCAL"], ["openai", "OPENAI"], ["gemini", "GEMINI"]].map(([value, label]) => h("button", { key: value, onClick: () => { setForecastBrain(value); setForecastModel(value === "openai" ? "gpt-4.1-mini" : value === "gemini" ? "gemini-2.5-flash" : "local"); }, style: { ...S.btn(forecastBrain === value ? "#a78bfa" : "#2a4060"), flex: 1 } }, label))
+              )
+            ),
+            forecastBrain !== "local" && h("div", { style: { marginBottom: 10 } },
+              h("div", { style: { fontSize: 9, color: "#4a6080", marginBottom: 5, letterSpacing: 1 } }, "MODEL"),
+              h("input", { style: S.inp, value: forecastModel, onChange: e => setForecastModel(e.target.value), placeholder: forecastBrain === "openai" ? "gpt-4.1-mini" : "gemini-2.5-flash" })
+            ),
+            forecastBrain !== "local" && h("div", { style: { marginBottom: 10 } },
+              h("div", { style: { fontSize: 9, color: "#4a6080", marginBottom: 5, letterSpacing: 1 } }, "API KEY"),
+              h("input", { style: S.inp, type: "password", value: forecastApiKey, onChange: e => setForecastApiKey(e.target.value), placeholder: forecastBrain === "openai" ? "Paste OpenAI API key" : "Paste Gemini API key" })
+            ),
+            h("div", { style: { fontSize: 10, color: "#64748b", lineHeight: 1.7 } },
+              forecastBrain === "local"
+                ? "Uses the built-in local prediction engine."
+                : "Requires the local proxy server on http://127.0.0.1:8787. Run: node forecast_proxy.js"
+            )
+          )
+        ),
+        h("div", { style: S.card },
+          h("div", { style: { fontSize: 9, color: "#4a6080", letterSpacing: 1, marginBottom: 12 } }, "REAL-TIME NOTES"),
+          h("div", { style: { fontSize: 12, color: "#94a3b8", lineHeight: 1.9 } },
+            h("div", null, "Browser-only public APIs will not match broker feeds like Pepperstone tick-for-tick."),
+            h("div", null, "If you want near real-time updates in this page, select TWELVE DATA, paste a valid API key, and keep refresh at 1 second."),
+            h("div", null, "If you want the closest match to your TradingView Pepperstone chart, the next step is a broker or paid streaming feed through a backend proxy or WebSocket gateway.")
+          )
+        )
+      )
+    )
+  );
+}
+
+ReactDOM.createRoot(document.getElementById("app")).render(h(App));
+</script>
+</body>
+</html>
