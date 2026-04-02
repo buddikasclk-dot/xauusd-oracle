@@ -33,7 +33,7 @@ input:focus, select:focus, textarea:focus { outline: 1px solid #fbbf2455; }
 const { useState, useEffect, useRef, useCallback } = React;
 const h = React.createElement;
 
-const STORAGE_KEY = "xauusd_oracle_live_v3";
+const STORAGE_KEY = "xauusd_oracle_live_v4_local_only";
 const BASE_CANDLE_MS = 60000;
 const HISTORY_LIMIT = 3000;
 const TF_CONFIG = {
@@ -49,9 +49,19 @@ const TF_CONFIG = {
 function safeReadStorage() {
   try {
     const raw = localStorage.getItem(STORAGE_KEY);
-    return raw ? JSON.parse(raw) : {};
+    const parsed = raw ? JSON.parse(raw) : {};
+    return {
+      ...parsed,
+      forecastBrain: "local",
+      forecastModel: "local",
+      forecastApiKey: ""
+    };
   } catch (err) {
-    return {};
+    return {
+      forecastBrain: "local",
+      forecastModel: "local",
+      forecastApiKey: ""
+    };
   }
 }
 
@@ -1364,7 +1374,7 @@ function App() {
   const [apiKey, setApiKey] = useState(persisted.apiKey || "");
   const [forecastBrain, setForecastBrain] = useState(persisted.forecastBrain || "local");
   const [forecastApiKey, setForecastApiKey] = useState(persisted.forecastApiKey || "");
-  const [forecastModel, setForecastModel] = useState(persisted.forecastModel || "gpt-4.1-mini");
+  const [forecastModel, setForecastModel] = useState(persisted.forecastModel || "local");
   const [pollMs, setPollMs] = useState(persisted.pollMs || 1000);
   const [alarms, setAlarms] = useState(Array.isArray(persisted.alarms) ? persisted.alarms : []);
   const [notifs, setNotifs] = useState([]);
@@ -1399,29 +1409,10 @@ function App() {
   const session = getMarketSessionStatus(new Date(clockNow));
 
   const fetchNews = useCallback(async () => {
-    try {
-      const resp = await fetch("http://127.0.0.1:8787/news");
-      if (!resp.ok) return;
-      const data = await resp.json();
-      const events = data.news || [];
-      setNewsEvents(events);
-      setNewsFetched(true);
-      const now = Date.now();
-      const imminent = events.some(e => {
-        const eventTime = new Date(e.time).getTime();
-        return Math.abs(eventTime - now) < 30 * 60 * 1000;
-      });
-      if (imminent) {
-        setNewsBlock(true);
-        addNotif("High-impact USD news event within 30 minutes - trades blocked", "warning");
-        beep(440, 2, "sine");
-      } else {
-        setNewsBlock(false);
-      }
-    } catch (err) {
-      setNewsFetched(false);
-    }
-  }, [addNotif]);
+    setNewsEvents([]);
+    setNewsFetched(true);
+    setNewsBlock(false);
+  }, []);
 
   useEffect(() => {
     fetchNews();
@@ -2283,21 +2274,13 @@ THINK STEP BY STEP:
             h("div", { style: { marginBottom: 10 } },
               h("div", { style: { fontSize: 9, color: "#4a6080", marginBottom: 5, letterSpacing: 1 } }, "PROVIDER"),
               h("div", { style: { display: "flex", gap: 6 } },
-                [["local", "LOCAL"], ["openai", "OPENAI"], ["gemini", "GEMINI"]].map(([value, label]) => h("button", { key: value, onClick: () => { setForecastBrain(value); setForecastModel(value === "openai" ? "gpt-4.1-mini" : value === "gemini" ? "gemini-2.5-flash" : "local"); }, style: { ...S.btn(forecastBrain === value ? "#a78bfa" : "#2a4060"), flex: 1 } }, label))
+                h("button", { style: { ...S.btn("#a78bfa"), flex: 1, cursor: "default" } }, "LOCAL")
               )
             ),
-            forecastBrain !== "local" && h("div", { style: { marginBottom: 10 } },
-              h("div", { style: { fontSize: 9, color: "#4a6080", marginBottom: 5, letterSpacing: 1 } }, "MODEL"),
-              h("input", { style: S.inp, value: forecastModel, onChange: e => setForecastModel(e.target.value), placeholder: forecastBrain === "openai" ? "gpt-4.1-mini" : "gemini-2.5-flash" })
-            ),
-            forecastBrain !== "local" && h("div", { style: { marginBottom: 10 } },
-              h("div", { style: { fontSize: 9, color: "#4a6080", marginBottom: 5, letterSpacing: 1 } }, "API KEY"),
-              h("input", { style: S.inp, type: "password", value: forecastApiKey, onChange: e => setForecastApiKey(e.target.value), placeholder: forecastBrain === "openai" ? "Paste OpenAI API key" : "Paste Gemini API key" })
-            ),
             h("div", { style: { fontSize: 10, color: "#64748b", lineHeight: 1.7 } },
-              forecastBrain === "local"
-                ? "Uses the built-in local prediction engine."
-                : "Requires the local proxy server on http://127.0.0.1:8787. Run: node forecast_proxy.js"
+              "Forecast Brain is locked to LOCAL in this live copy, so the app works anywhere without a proxy server.",
+              h("br"),
+              "OpenAI and Gemini AI forecasts are disabled here, but all 13 indicators and the built-in strategy engine still work normally."
             )
           )
         ),
@@ -2306,6 +2289,7 @@ THINK STEP BY STEP:
           h("div", { style: { fontSize: 12, color: "#94a3b8", lineHeight: 1.9 } },
             h("div", null, "Browser-only public APIs will not match broker feeds like Pepperstone tick-for-tick."),
             h("div", null, "If you want near real-time updates in this page, select TWELVE DATA, paste a valid API key, and keep refresh at 1 second."),
+            h("div", null, "This live copy stays fully browser-based: LOCAL forecast mode is enabled and localhost proxy/news services are disabled."),
             h("div", null, "If you want the closest match to your TradingView Pepperstone chart, the next step is a broker or paid streaming feed through a backend proxy or WebSocket gateway.")
           )
         )
